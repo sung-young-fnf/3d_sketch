@@ -43,6 +43,8 @@ export type SceneItem = {
   size: [number, number, number];
   /** 매장연출 slot: how a swapped-in product sits, over its category's mount (place = on a shelf) */
   mount?: "hang" | "place";
+  /** 매장연출 slot on a sloped tray: a swapped-in product is also tipped forward this much (deg, front edge down) */
+  tilt?: number;
   /** 매장연출 side-hung item built thin (its depth scale); the viewer's 옆걸이 촘촘히 off shows it at full depth */
   thin?: number;
   /** 매장연출 side-hung slot: a swapped-in product is squashed to this share of its depth (packed on the rail) */
@@ -93,6 +95,39 @@ export type SceneShot = {
   racks?: SceneRack[];
   /** 매장연출 shelves / rails that move up and down (scripts/build_vignettes.py Vignette.level) */
   levels?: SceneLevel[];
+  /** 매장연출 집기: bay zones whose type changes + props that move / come off (Vignette.zone / prop) */
+  fixtures?: SceneFixture[];
+  /** 매장연출 칸: where 집기 도구 go (a bay = the zones of one group), mm */
+  bays?: SceneBay[];
+};
+
+export type SceneBay = { id: string; label: string; x: number; w: number; z: number; y0: number; y1: number };
+
+/** One way a fixture can look: the items (and the racks / levels among them) shown when it is chosen. */
+export type FixtureOption = {
+  id: string;
+  label: string;
+  /** zone:<zone id> = that bay's own make-up (copied here), mod:<name> = a shared module, base = a prop as built */
+  kind: string;
+  itemIds: string[];
+  rackIds: string[];
+  levelIds: string[];
+};
+
+/** A 집기: a bay (top / bottom / whole) whose type can change, or a prop / floor display. The first option is as built;
+ *  the others are hidden (and not loaded) until chosen. Moving it moves every option's items. */
+export type SceneFixture = {
+  id: string;
+  /** 1칸 / 왼쪽 칸 / 바닥 ... - the 집기 tab groups by it */
+  group: string;
+  label: string;
+  /** zones only: 위 / 아래 / 전체 - 모든 칸 같은 타입 applies a type to the zones of the same tier */
+  tier?: string;
+  /** x: along the wall / stand, xy: on the wall, xz: on the floor */
+  move: "x" | "xy" | "xz";
+  /** 집기 도구 in a bay's pool: option 0 = not there, 1 = the piece (its one level) */
+  part?: { bay: string; type: string };
+  options: FixtureOption[];
 };
 
 /** A shelf or rail on slotted uprights: its items (board, brackets, what stands on it) and racks move up / down together. */
@@ -110,6 +145,8 @@ export type SceneLevel = {
   min: number;
   max: number;
   step: number;
+  /** 옆걸이 + 정면걸이 together on it: its zone gets 좌우 뒤집기 (shown with the combo icon) */
+  fixed?: boolean;
 };
 
 /** A rail / loop / arm: its slots' items are the garments, `count` of them shown and re-spaced along from -> to. */
@@ -141,7 +178,8 @@ export type SceneSlot = {
   label: string;
   /** 상품 category (first folder: 패딩 / 가방 / 신발) offered in 상품 변경; all when unset */
   category?: string;
-  /** VmdProduct id this slot shows at first (as if swapped in), until the page's swaps are changed */
+  /** VmdProduct id the reference photo shows here (build_vignettes defaults) - kept as a note, the viewer starts
+   *  every slot on the store's own model and swaps only when someone picks a product */
   product?: string;
   /** image = a poster / screen whose front face takes a dropped or picked image instead of a product */
   kind?: "image";
@@ -156,6 +194,8 @@ export type StoreScene = {
   drawings: DrawingPage[];
   /** 매장연출: hanger glb (hook top at its origin) a hung VMD product without its own hook is put on */
   hanger?: string;
+  /** 매장연출: clip-bar pants hanger glb (hook top at its origin) for 팬츠 / 스커트 */
+  pantsHanger?: string;
 };
 
 export type VmdProduct = {

@@ -71,6 +71,9 @@ def main():
     recolor(DUFFEL, os.path.join(OUT, "v8_더플백.glb"), lin("3a2a20"))
     recolor(BOARD, os.path.join(OUT, "v8_캡선반.glb"), lin("6a6a6c"), rough=0.55, plain=True)
     P.subset(HEAD, os.path.join(OUT, "v8_두상.glb"), lambda lo, hi, name: lo[2] > 0)
+    # the same head stand split: the bare head + neck (the cap is a swappable 모자 slot sitting on it), and its cap
+    P.subset(HEAD, os.path.join(OUT, "v8_두상_머리.glb"), lambda lo, hi, name: lo[2] > 0 and lo[1] < 130)
+    P.subset(HEAD, os.path.join(OUT, "v8_두상_캡.glb"), lambda lo, hi, name: lo[2] > 0 and lo[1] >= 130)
 
 
 if __name__ == "__main__":

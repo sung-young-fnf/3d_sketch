@@ -3,7 +3,7 @@
 ([DX명동]벽 행거_1단 cut into uprights / back panel / rail / shelf board by scripts/vignettes/v7_parts.py).
 
   bay 1 (wood):  shelf 1580 (RUN&FIT letters, framed poster P01, mountain sculpture), side-hung rail 1500 (8)
-  bay 2 (white): poster P02 on the panel, shelf 1790 (2 shoes), shelf 1444 (3 caps), side-hung rail 1366 (10)
+  bay 2 (white): poster P02 on the panel, shelf 1790 (2 shoes), shelf 1444 (3 caps H01-03), side-hung rail 1366 (10)
   bay 3 (wood):  shelf 1539 (2 torsos in T-shirts + D sculpture), rail 1460: 1 face-out + 5 side-hung
   bay 4 (white): face-out bar 2450 (3 T-shirts), empty shelf 1413, side-hung rail 1350 (13)
   floor: two granite plinths with a pair of shoes each
@@ -68,82 +68,94 @@ def build(V):
                line=[[x0, y, zs[0]], [x1, y, zs[0]]], bounds=(bay_x - 540 - x0, bay_x + 540 - x0),
                **({"swapDepth": V.SIDE_DEPTH} if facing == 90 else {}))
 
-    # ---- bay 1: shelf + side-hung rail, both reaching past the left upright to the niche wall
-    x = bays[0]
-    y = Y(832)
-    things = [shelf("b1-shelf", -2420, -1100, y)]
-    things.append(v.put("v7_사인_런앤핏", "runfit-sign", [XF(253), y + 108, 200]))
-    v.picture("v7_포스터_액자", "P01", "1칸 액자 포스터", [XF(388), y + 355, 120])
-    things.append(v.items[-1])
-    things.append(v.put("v7_조형_산", "mountain", [XF(537), y + 273, 160]))
-    v.level("b1-shelf", "1칸", "선반", y, things, 1200, 2000)
-    y = Y(858)
-    cols = ["카키", "카키", "회색", "회색", "브라운", "블랙", "네이비", "블랙", "회색", "블랙"]
-    hung("b1-rail", "1칸", "옆걸이", "A", 1, -2380, -1160, y, cols, 8, 150, -1770)
-    v.level("b1-rail", "1칸", "봉", y, [bar("b1-bar", -2420, -1120, y)], 1000, 1800, racks=["b1-rail"])
-    v.racks[-1]["bounds"] = [-40, 1260]  # whole rail: niche wall .. right upright
+    with v.zone("b1", "1칸", "1칸", "전체", dict(x=-1650, w=1080, z=70, y0=300, y1=2500), "A"):
+        # ---- bay 1: shelf + side-hung rail, both reaching past the left upright to the niche wall
+        x = bays[0]
+        y = Y(832)
+        things = [shelf("b1-shelf", -2420, -1100, y)]
+        with v.prop("sign", "1칸", "RUN&FIT 사인", "xy"):
+            things.append(v.put("v7_사인_런앤핏", "runfit-sign", [XF(253), y + 108, 200]))
+        with v.prop("poster1", "1칸", "액자 포스터", "xy"):
+            v.picture("v7_포스터_액자", "P01", "1칸 액자 포스터", [XF(388), y + 355, 120])
+        things.append(v.items[-1])
+        with v.prop("mountain", "1칸", "산 조형물", "xy"):
+            things.append(v.put("v7_조형_산", "mountain", [XF(537), y + 273, 160]))
+        v.level("b1-shelf", "1칸", "선반", y, things, 1200, 2000)
+        y = Y(858)
+        cols = ["카키", "카키", "회색", "회색", "브라운", "블랙", "네이비", "블랙", "회색", "블랙"]
+        hung("b1-rail", "1칸", "옆걸이", "A", 1, -2380, -1160, y, cols, 8, 150, -1770)
+        v.level("b1-rail", "1칸", "봉", y, [bar("b1-bar", -2420, -1120, y)], 1000, 1800, racks=["b1-rail"])
+        v.racks[-1]["bounds"] = [-40, 1260]  # whole rail: niche wall .. right upright
 
-    # ---- bay 2: poster on the panel, shoe shelf, cap shelf, side-hung rail
-    x = bays[1]
-    v.picture("v7_포스터_런앤핏", "P02", "2칸 RUN&FIT 포스터", [X(888), Y(685), 80])
-    y = Y(765)
-    shoes = [v.product("운동화", f"S0{i + 1}", f"2칸 위 선반 신발 {i + 1}", "신발", [XF(px), y, 250], -90,
-                       rot=V.rot_y(-90), default="DXSH4236N_WHS", mount="place") for i, px in enumerate((705, 755))]
-    v.level("b2-top", "2칸", "위 선반", y, [shelf("b2-top", x - 540, x + 540, y)] + shoes, 1500, 2200)
-    y = Y(875)
-    caps = [v.put(f"v7_볼캡_{c}", f"cap{i + 1}", [XF(px), y, 240]) for i, (c, px) in
-            enumerate((("블랙", 670), ("베이지", 812), ("라임", 950)))]
-    v.level("b2-mid", "2칸", "아래 선반", y, [shelf("b2-mid", x - 540, x + 540, y)] + caps, 1100, 1800)
-    y = Y(900)
-    cols = ["연하늘", "하늘", "하늘", "회색", "회색", "회색", "블랙", "오렌지", "회색", "라임", "블랙", "회색"]
-    hung("b2-rail", "2칸", "옆걸이", "B", 1, x - 480, x + 480, y, cols, 10, 130, x)
-    v.level("b2-rail", "2칸", "봉", y, [bar("b2-bar", x - 540, x + 540, y)], 900, 1700, racks=["b2-rail"])
+    with v.zone("b2", "2칸", "2칸", "전체", dict(x=-550, w=1080, z=70, y0=300, y1=2500), "B"):
+        # ---- bay 2: poster on the panel, shoe shelf, cap shelf, side-hung rail
+        x = bays[1]
+        with v.prop("poster2", "2칸", "RUN&FIT 포스터", "xy"):
+            v.picture("v7_포스터_런앤핏", "P02", "2칸 RUN&FIT 포스터", [X(888), Y(685), 80])
+        y = Y(765)
+        shoes = [v.product("운동화", f"S0{i + 1}", f"2칸 위 선반 신발 {i + 1}", "신발", [XF(px), y, 250], -90,
+                           rot=V.rot_y(-90), default="DXSH4236N_WHS", mount="place") for i, px in enumerate((705, 755))]
+        v.level("b2-top", "2칸", "위 선반", y, [shelf("b2-top", x - 540, x + 540, y)] + shoes, 1500, 2200)
+        y = Y(875)
+        caps = [v.product(f"v7_볼캡_{c}", f"H0{i + 1}", f"2칸 아래 선반 모자 {i + 1}", "모자", [XF(px), y, 240], 0,
+                          mount="place") for i, (c, px) in enumerate((("블랙", 670), ("베이지", 812), ("라임", 950)))]
+        v.level("b2-mid", "2칸", "아래 선반", y, [shelf("b2-mid", x - 540, x + 540, y)] + caps, 1100, 1800)
+        y = Y(900)
+        cols = ["연하늘", "하늘", "하늘", "회색", "회색", "회색", "블랙", "오렌지", "회색", "라임", "블랙", "회색"]
+        hung("b2-rail", "2칸", "옆걸이", "B", 1, x - 480, x + 480, y, cols, 10, 130, x)
+        v.level("b2-rail", "2칸", "봉", y, [bar("b2-bar", x - 540, x + 540, y)], 900, 1700, racks=["b2-rail"])
 
-    # ---- bay 3: torsos in T-shirts on the shelf, a face-out + side-hung on the rail
-    x = bays[2]
-    y = Y(845)
-    tee_hook = hook("v7_티셔츠_화이트")
-    things = [shelf("b3-shelf", x - 540, x + 540, y), v.put("v7_조형_D", "d-logo", [XF(1088), y + 110, 180])]
-    for i, (px, top_py, c) in enumerate(((1165, 600, "화이트"), (1305, 552, "라임"))):
-        h = Y(top_py) - y  # torso top above the shelf
-        s = h / 1102
-        tx = XF(px)
-        things.append(v.product("토르소", f"M0{i + 1}", f"3칸 토르소 {i + 1}", "착장", [tx, y, 230], 0,
-                                scale=(s, s, s), fit="model"))
-        # the T-shirt it wears: the store tee, hanger clipped off, over the torso's chest
-        tee_y = y + h * 0.80 - 600
-        things.append(v.put(f"v7_티셔츠_{c}", f"torso-tee{i + 1}", [tx, tee_y, 230 + 221 * s + 10],
-                            scale=(1.0, 1.0, 1.0), clip=[0, tee_y + 610]))
-    v.level("b3-shelf", "3칸", "선반", y, things, 1200, 1900)
-    y = Y(870)
-    hung("b3-front", "3칸", "정면걸이", "C", 1, XF(1155), XF(1155), y, ["브라운"], 1, None, x, facing=0, z=rail_z + 40)
-    hung("b3-rail", "3칸", "옆걸이", "C", 2, XF(1260), x + 500, y, ["연하늘", "블랙", "회색", "라임", "라임", "화이트", "블랙"],
-         5, 120, x)
-    v.racks[-1]["bounds"] = [-80, x + 540 - XF(1260)]
-    v.level("b3-rail", "3칸", "봉", y, [bar("b3-bar", x - 540, x + 540, y)], 1000, 1800,
-            racks=["b3-front", "b3-rail"])
+    with v.zone("b3", "3칸", "3칸", "전체", dict(x=550, w=1080, z=70, y0=300, y1=2500), "C"):
+        # ---- bay 3: torsos in T-shirts on the shelf, a face-out + side-hung on the rail
+        x = bays[2]
+        y = Y(845)
+        tee_hook = hook("v7_티셔츠_화이트")
+        things = [shelf("b3-shelf", x - 540, x + 540, y)]
+        with v.prop("dlogo", "3칸", "D 조형물", "xy"):
+            things.append(v.put("v7_조형_D", "d-logo", [XF(1088), y + 110, 180]))
+        for i, (px, top_py, c) in enumerate(((1165, 600, "화이트"), (1305, 552, "라임"))):
+            h = Y(top_py) - y  # torso top above the shelf
+            s = h / 1102
+            tx = XF(px)
+            with v.prop(f"torso{i + 1}", "3칸", f"토르소 {i + 1}", "x"):
+                things.append(v.product("토르소", f"M0{i + 1}", f"3칸 토르소 {i + 1}", "착장", [tx, y, 230], 0,
+                                        scale=(s, s, s), fit="model"))
+                # the T-shirt it wears: the store tee, hanger clipped off, over the torso's chest
+                tee_y = y + h * 0.80 - 600
+                things.append(v.put(f"v7_티셔츠_{c}", f"torso-tee{i + 1}", [tx, tee_y, 230 + 221 * s + 10],
+                                    scale=(1.0, 1.0, 1.0), clip=[0, tee_y + 610]))
+        v.level("b3-shelf", "3칸", "선반", y, things, 1200, 1900)
+        y = Y(870)
+        hung("b3-front", "3칸", "정면걸이", "C", 1, XF(1155), XF(1155), y, ["브라운"], 1, None, x, facing=0, z=rail_z + 40)
+        hung("b3-rail", "3칸", "옆걸이", "C", 2, XF(1260), x + 500, y, ["연하늘", "블랙", "회색", "라임", "라임", "화이트", "블랙"],
+             5, 120, x)
+        v.racks[-1]["bounds"] = [-80, x + 540 - XF(1260)]
+        v.level("b3-rail", "3칸", "봉", y, [bar("b3-bar", x - 540, x + 540, y)], 1000, 1800,
+                racks=["b3-front", "b3-rail"])
 
-    # ---- bay 4: face-out T-shirts on a top bar, empty shelf, long side-hung rail
-    x = bays[3]
-    y = Y(555)
-    hung("b4-top", "4칸", "위 정면걸이", "D", 1, XF(1520), XF(1840), y, ["v7_티셔츠_토프", "v7_티셔츠_라임", "v7_티셔츠_화이트"],
-         3, 330, x, facing=0, z=[rail_z, rail_z + 30, rail_z - 30])
-    v.level("b4-top", "4칸", "위 봉", y, [bar("b4-topbar", x - 540, x + 540, y)], 1900, 2500, racks=["b4-top"])
-    y = Y(885)
-    v.level("b4-shelf", "4칸", "선반", y, [shelf("b4-shelf", x - 540, x + 600, y)], 1100, 1900)
-    y = Y(905)
-    cols = ["크림", "화이트", "브라운", "블랙", "화이트", "토프", "화이트", "회색", "블랙", "핑크", "블랙", "브라운", "네이비",
-            "회색", "블랙"]
-    hung("b4-rail", "4칸", "옆걸이", "D", 4, x - 500, x + 600, y, cols, 13, 90, x)
-    v.racks[-1]["bounds"] = [-40, 1150]
-    v.level("b4-rail", "4칸", "봉", y, [bar("b4-bar", x - 540, x + 640, y)], 900, 1700, racks=["b4-rail"])
+    with v.zone("b4", "4칸", "4칸", "전체", dict(x=1650, w=1080, z=70, y0=300, y1=2500), "D"):
+        # ---- bay 4: face-out T-shirts on a top bar, empty shelf, long side-hung rail
+        x = bays[3]
+        y = Y(555)
+        hung("b4-top", "4칸", "위 정면걸이", "D", 1, XF(1520), XF(1840), y, ["v7_티셔츠_토프", "v7_티셔츠_라임", "v7_티셔츠_화이트"],
+             3, 330, x, facing=0, z=[rail_z, rail_z + 30, rail_z - 30])
+        v.level("b4-top", "4칸", "위 봉", y, [bar("b4-topbar", x - 540, x + 540, y)], 1900, 2500, racks=["b4-top"])
+        y = Y(885)
+        v.level("b4-shelf", "4칸", "선반", y, [shelf("b4-shelf", x - 540, x + 600, y)], 1100, 1900)
+        y = Y(905)
+        cols = ["크림", "화이트", "브라운", "블랙", "화이트", "토프", "화이트", "회색", "블랙", "핑크", "블랙", "브라운", "네이비",
+                "회색", "블랙"]
+        hung("b4-rail", "4칸", "옆걸이", "D", 4, x - 500, x + 600, y, cols, 13, 90, x)
+        v.racks[-1]["bounds"] = [-40, 1150]
+        v.level("b4-rail", "4칸", "봉", y, [bar("b4-bar", x - 540, x + 640, y)], 900, 1700, racks=["b4-rail"])
 
     # ---- floor: granite plinths, a pair of shoes on each
     for key, cx, w, h, shoe, px in (("left", -1950, 820, 220, "DXSH4236N_WHS", (215, 300)),
                                     ("mid", 350, 560, 260, "DXSH4236N_BES", (1110, 1150))):
-        v.put("v7_좌대", f"plinth-{key}", [cx, 0, 650], scale=(w / 1000, h / 1000, 520 / 1000))
-        for k, dx in enumerate((-80, 80)):
-            sid = f"F{len([s for s in v.slots if s['id'].startswith('F')]) + 1:02d}"
-            v.product("운동화", sid, f"{'왼쪽' if key == 'left' else '가운데'} 좌대 신발 {k + 1}", "신발",
-                      [cx + dx, h, 650], 0, default=shoe)
+        with v.prop(f"plinth-{key}", "바닥", "좌대 (왼쪽)" if key == "left" else "좌대 (가운데)", "xz"):
+            v.put("v7_좌대", f"plinth-{key}", [cx, 0, 650], scale=(w / 1000, h / 1000, 520 / 1000))
+            for k, dx in enumerate((-80, 80)):
+                sid = f"F{len([s for s in v.slots if s['id'].startswith('F')]) + 1:02d}"
+                v.product("운동화", sid, f"{'왼쪽' if key == 'left' else '가운데'} 좌대 신발 {k + 1}", "신발",
+                          [cx + dx, h, 650], 0, default=shoe)
     return v.scene([0, 1450, 4600], 50)

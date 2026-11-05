@@ -51,6 +51,9 @@ function dateLabel(value: string): string {
 
 type MainTab = "content" | "portfolio" | "estimate";
 type SubTab = "overview" | "render" | "store" | "vmd" | "drawing";
+/** 전체 렌더링 (the whole store in orbit view) is switched off for now: 매장연출 is the focus, and the full store's
+ * hundreds of MB slowed the page down. true brings the tab back. */
+const OVERVIEW_ON = false;
 
 function EmptyState({ title, hint }: { title: string; hint: string }) {
   return (
@@ -261,7 +264,9 @@ export default function ProjectDetail({
 }) {
   const [tab, setTab] = useState<MainTab>("content");
   const store = project.store ?? null;
-  const [sub, setSub] = useState<SubTab>(store ? "overview" : "render");
+  const [sub, setSub] = useState<SubTab>(
+    store && OVERVIEW_ON ? "overview" : store?.vignettes?.length ? "vmd" : "render",
+  );
   const linkedSet = new Set(localProductIds);
 
   return (
@@ -319,7 +324,7 @@ export default function ProjectDetail({
         <div>
           <div className="subtabs">
             {([
-              ...(store ? ([["overview", "전체 렌더링"]] as Array<[SubTab, string]>) : []),
+              ...(store && OVERVIEW_ON ? ([["overview", "전체 렌더링"]] as Array<[SubTab, string]>) : []),
               ["render", `렌더 샷${project.counts.render ? ` ${project.counts.render}` : ""}`],
               ["store", "3D 매장 보기"],
               ...(store?.vignettes?.length ? ([["vmd", "매장연출"]] as Array<[SubTab, string]>) : []),
@@ -336,7 +341,7 @@ export default function ProjectDetail({
             ))}
           </div>
 
-          {sub === "overview" && store && <StoreViewer scene={store.scene} products={store.products} mode="orbit" />}
+          {OVERVIEW_ON && sub === "overview" && store && <StoreViewer scene={store.scene} products={store.products} mode="orbit" />}
           {sub === "render" && <RenderShots renders={project.renders} />}
           {sub === "store" &&
             (store ? (

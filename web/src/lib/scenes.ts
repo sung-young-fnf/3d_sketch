@@ -48,6 +48,7 @@ function resolveScene(raw: StoreScene): StoreScene {
     })),
     shots: raw.shots.map((shot) => ({ ...shot, thumb: toUrl(shot.thumb) })),
     ...(raw.hanger ? { hanger: toUrl(raw.hanger) ?? undefined } : {}),
+    ...(raw.pantsHanger ? { pantsHanger: toUrl(raw.pantsHanger) ?? undefined } : {}),
     drawings: (raw.drawings ?? []).map((d) => ({ ...d, url: toUrl(d.url) ?? "" })),
   };
 }

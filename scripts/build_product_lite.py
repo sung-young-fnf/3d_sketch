@@ -3,7 +3,8 @@ VMD 상품 웹용 가벼운 사본 -> assets/F&F/국내-명동/[디스커버리 
 
 The painted product glbs (UniForge3D paint_texture) are ~50 MB each: ~0.9 M triangles and a 4K PNG. A wall with
 30 of them downloads 1.6 GB and draws ~28 M triangles, so the web viewer (web/src/lib/scenes.ts getVmdProducts)
-uses these copies instead: decimated to ~TRIS triangles, texture TEX px JPEG. The originals stay as they are
+uses these copies instead: decimated to ~TRIS triangles (not lower: the texture seams tear and the jacket looks
+broken), texture TEX px JPEG, geometry Draco-compressed (the viewer decodes it from web/public/draco). The originals stay as they are
 (Blender, library, re-painting). A copy is rebuilt only when its source is newer.
 `-- items`: the same for every scene item glb over ITEM_MB in data/vignettes (the bare torso, the store 패딩, the
 recoloured hoodies ...) -> assets/F&F/_웹/<path under assets/F&F>; build_vignettes.py put() then points at it.
@@ -18,8 +19,8 @@ import bpy
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "assets", "F&F", "국내-명동", "[디스커버리 명동]", "상품")
 DST = os.path.join(ROOT, "assets", "F&F", "국내-명동", "[디스커버리 명동]", "상품_웹")
-TRIS = 60000
-TEX = 1024
+TRIS = 250000
+TEX = 2048
 ITEM_MB = 8
 FF = os.path.join(ROOT, "assets", "F&F")
 
@@ -30,6 +31,10 @@ def lite(src, dst):
     meshes = [o for o in bpy.context.scene.objects if o.type == "MESH"]
     tris = sum(sum(len(p.vertices) - 2 for p in o.data.polygons) for o in meshes)
     ratio = min(1.0, TRIS / max(tris, 1))
+    if ratio == 1 and "_웹" in dst and "상품_웹" not in dst:
+        # a scene item that is heavy only for its textures (the wall hangers): JPEG would drop their glass alpha
+        print(f"keep {os.path.relpath(src, ROOT)} (only {tris} tris)", flush=True)
+        return
     for o in meshes:
         if ratio < 1:
             m = o.modifiers.new("lite", "DECIMATE")
@@ -40,7 +45,10 @@ def lite(src, dst):
             img.scale(min(TEX, img.size[0]), min(TEX, img.size[1]))
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     bpy.ops.export_scene.gltf(filepath=dst, export_format="GLB", export_apply=True, export_image_format="JPEG",
-                              export_image_quality=88, use_selection=False)
+                              export_image_quality=90, use_selection=False,
+                              export_draco_mesh_compression_enable=True, export_draco_mesh_compression_level=6,
+                              export_draco_position_quantization=14, export_draco_normal_quantization=10,
+                              export_draco_texcoord_quantization=12)
     print(f"lite {os.path.relpath(dst, ROOT)}  {tris} -> ~{int(tris * ratio)} tris  "
           f"{os.path.getsize(src) / 1e6:.1f} -> {os.path.getsize(dst) / 1e6:.1f} MB", flush=True)
 

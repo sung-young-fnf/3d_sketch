@@ -82,51 +82,61 @@ def build(V):
     shown = {0: 13, 2: 15}
     for i, (group, pf, arm, loop) in tops.items():
         x = CX[i]
-        v.put("v6 팔", f"{pf}-arm", [x, 0, 0], scale=(SX, 1, 1))
-        v.put("v6 고리", f"{pf}-loop", [x, 0, 0], scale=(SX, 1, 1))
-        hung(f"{pf}-arm", group, "위 정면걸이", pf, 1, x + ARM_X, x + ARM_X, TOP_BAR, 300, arm, 1, 60, 0, 0,
-             facing=0, anchor="start")
-        hung(f"{pf}-loop", group, "위 옆걸이", pf, 4, x + LOOP_X[0], x + LOOP_X[1], TOP_BAR, LOOP_Z, loop, 2, 160,
-             x + LOOP_X[0] - 60, x + LOOP_X[1] + 60)
-        y = 1151
-        hung(f"{pf}-rail", group, "아래 옆걸이", pf, 8, x - half + 50, x + half - 50, y - LEDGE_RAIL, RAIL_Z, rails[i],
-             shown[i], 80, x - half, x + half)
-        v.level(f"{pf}-ledge", group, "선반·봉", y, [ledge(pf, x, y)], 900, 1450, racks=[f"{pf}-rail"])
+        with v.zone(f"top{i + 1}", group, f"{group} 위", "위", dict(x=x, w=1160, z=90, y0=1500, y1=2350), pf):
+            v.put("v6 팔", f"{pf}-arm", [x, 0, 0], scale=(SX, 1, 1))
+            v.put("v6 고리", f"{pf}-loop", [x, 0, 0], scale=(SX, 1, 1))
+            hung(f"{pf}-arm", group, "위 정면걸이", pf, 1, x + ARM_X, x + ARM_X, TOP_BAR, 300, arm, 1, 60, 0, 0,
+                 facing=0, anchor="start")
+            hung(f"{pf}-loop", group, "위 옆걸이", pf, 4, x + LOOP_X[0], x + LOOP_X[1], TOP_BAR, LOOP_Z, loop, 2, 160,
+                 x + LOOP_X[0] - 60, x + LOOP_X[1] + 60)
+        with v.zone(f"bot{i + 1}", group, f"{group} 아래", "아래", dict(x=x, w=1160, z=90, y0=300, y1=1500), pf):
+            y = 1151
+            hung(f"{pf}-rail", group, "아래 옆걸이", pf, 8, x - half + 50, x + half - 50, y - LEDGE_RAIL, RAIL_Z, rails[i],
+                 shown[i], 80, x - half, x + half)
+            v.level(f"{pf}-ledge", group, "선반·봉", y, [ledge(pf, x, y)], 900, 1450, racks=[f"{pf}-rail"])
 
     # ---- 2칸: poster, ledge 1380 with 3 waist bags, rail with a face-out + side-hung, plinth with shoes
     x, y = CX[1], 1380
-    v.picture("v6 포스터", "P01", "2칸 포스터", [x, 1770, 30])
-    bag_s = 0.65
-    bags = [v.product("v6 크로스백", f"G0{k + 1}", f"2칸 선반 가방 {k + 1}", "가방", [x + dx, y, 250], 0,
-                      scale=(bag_s,) * 3, mount="place") for k, dx in enumerate((-430, -15, 350))]
-    hung("B-face", "2칸", "봉 정면걸이", "B", 1, x - 300, x - 300, y - LEDGE_RAIL, RAIL_Z, ["후드티 라이트그레이"], 1, 60,
-         0, 0, facing=0, anchor="start")
-    hung("B-rail", "2칸", "봉 옆걸이", "B", 2, x + 60, x + half - 50, y - LEDGE_RAIL, RAIL_Z,
-         ["맨투맨 브라운", "바지 블랙", "바지 네이비", "맨투맨 블랙", "맨투맨 블랙", "맨투맨 그레이", "맨투맨 네이비"], 5, 90,
-         x + 10, x + half)
-    v.level("B-ledge", "2칸", "선반·봉", y, [ledge("B", x, y), *bags], 1100, 1450, racks=["B-face", "B-rail"])
+    with v.zone("top2", "2칸", "2칸 위", "위", dict(x=x, w=1160, z=90, y0=1500, y1=2350), "B"):
+        with v.prop("poster", "2칸", "포스터", "xy"):
+            v.picture("v6 포스터", "P01", "2칸 포스터", [x, 1770, 30])
+    with v.zone("bot2", "2칸", "2칸 아래", "아래", dict(x=x, w=1160, z=90, y0=300, y1=1500), "B"):
+        bag_s = 0.65
+        bags = [v.product("v6 크로스백", f"G0{k + 1}", f"2칸 선반 가방 {k + 1}", "가방", [x + dx, y, 250], 0,
+                          scale=(bag_s,) * 3, mount="place") for k, dx in enumerate((-430, -15, 350))]
+        hung("B-face", "2칸", "봉 정면걸이", "B", 1, x - 300, x - 300, y - LEDGE_RAIL, RAIL_Z, ["후드티 라이트그레이"], 1, 60,
+             0, 0, facing=0, anchor="start")
+        hung("B-rail", "2칸", "봉 옆걸이", "B", 2, x + 60, x + half - 50, y - LEDGE_RAIL, RAIL_Z,
+             ["맨투맨 브라운", "바지 블랙", "바지 네이비", "맨투맨 블랙", "맨투맨 블랙", "맨투맨 그레이", "맨투맨 네이비"], 5, 90,
+             x + 10, x + half)
+        v.level("B-ledge", "2칸", "선반·봉", y, [ledge("B", x, y), *bags], 1100, 1450, racks=["B-face", "B-rail"])
 
     # ---- 4칸: ledge 1380 with the cap on a head stand + backpack, rail with a face-out + side-hung
     x = CX[3]
-    stand = v.put("v6 모자 스탠드", "D-stand", [x - 200, y, 250])
-    cap = v.put("v6 볼캡", "D-cap", [x - 200, y + 490 - 70, 255])
-    bp = V.bbox(V.LIB["디스커버리백팩"])
-    bp_s = 520 / (bp[1][1] - bp[0][1])
-    pack = v.product("디스커버리백팩", "G04", "4칸 선반 백팩", "가방", [x + 330, y, 250], 0, scale=(bp_s,) * 3,
-                     default="X26NDXBK3506N_DWS", mount="place")
-    hung("D-face", "4칸", "봉 정면걸이", "D", 1, x - 300, x - 300, y - LEDGE_RAIL, RAIL_Z, ["맨투맨 세이지"], 1, 60,
-         0, 0, facing=0, anchor="start")
-    hung("D-rail", "4칸", "봉 옆걸이", "D", 2, x + 40, x + half - 30, y - LEDGE_RAIL, RAIL_Z,
-         ["맨투맨 화이트", "맨투맨 아이보리", "맨투맨 블랙", "바지 블랙", "바지 네이비", "맨투맨 브라운", "바지 블랙", "맨투맨 차콜"], 7, 85,
-         x - 10, x + half + 20)
-    v.level("D-ledge", "4칸", "선반·봉", y, [ledge("D", x, y), stand, cap, pack], 1100, 1600, racks=["D-face", "D-rail"])
+    with v.zone("bot4", "4칸", "4칸 아래", "아래", dict(x=x, w=1160, z=90, y0=300, y1=1500), "D"):
+        stand = v.put("v6 모자 스탠드", "D-stand", [x - 200, y, 250])
+        cap = v.put("v6 볼캡", "D-cap", [x - 200, y + 490 - 70, 255])
+        bp = V.bbox(V.LIB["디스커버리백팩"])
+        bp_s = 520 / (bp[1][1] - bp[0][1])
+        pack = v.product("디스커버리백팩", "G04", "4칸 선반 백팩", "가방", [x + 330, y, 250], 0, scale=(bp_s,) * 3,
+                         default="X26NDXBK3506N_DWS", mount="place")
+        hung("D-face", "4칸", "봉 정면걸이", "D", 1, x - 300, x - 300, y - LEDGE_RAIL, RAIL_Z, ["맨투맨 세이지"], 1, 60,
+             0, 0, facing=0, anchor="start")
+        hung("D-rail", "4칸", "봉 옆걸이", "D", 2, x + 40, x + half - 30, y - LEDGE_RAIL, RAIL_Z,
+             ["맨투맨 화이트", "맨투맨 아이보리", "맨투맨 블랙", "바지 블랙", "바지 네이비", "맨투맨 브라운", "바지 블랙", "맨투맨 차콜"], 7, 85,
+             x - 10, x + half + 20)
+        v.level("D-ledge", "4칸", "선반·봉", y, [ledge("D", x, y), stand, cap, pack], 1100, 1600, racks=["D-face", "D-rail"])
+
+    with v.zone("top4", "4칸", "4칸 위", "위", dict(x=CX[3], w=1160, z=90, y0=1500, y1=2350), "D"):
+        pass  # nothing above 4칸's ledge in the photo
 
     # ---- plinths (granite, 450 x 220 x 450) with a pair of shoes each: 2칸 left (white), 4칸 left (black)
     plinth_h = 220
     n = 0
     for px, default in ((CX[1] - 355, "DXSH4236N_WHS"), (CX[3] - 380, "DXSH4236N_BKS")):
-        v.put("v6 좌대", f"plinth{n // 2 + 1}", [px, 0, 260], scale=(1, plinth_h / 250, 1))
-        for dx in (-75, 75):
-            n += 1
-            v.product("운동화", f"S{n:02d}", f"좌대 신발 {n}", "신발", [px + dx, plinth_h, 260], 0, default=default)
+        with v.prop(f"plinth{n // 2 + 1}", "바닥", f"좌대 {n // 2 + 1}", "xz"):
+            v.put("v6 좌대", f"plinth{n // 2 + 1}", [px, 0, 260], scale=(1, plinth_h / 250, 1))
+            for dx in (-75, 75):
+                n += 1
+                v.product("운동화", f"S{n:02d}", f"좌대 신발 {n}", "신발", [px + dx, plinth_h, 260], 0, default=default)
     return v.scene([0, 1300, 4400], 40)

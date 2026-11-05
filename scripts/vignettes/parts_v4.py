@@ -12,7 +12,7 @@ heights / widths than in the library fixture, so they are cut apart (same meshes
   - v4_고리        the 3-2 round loop bar + its 2 brackets; left bracket at x 0, bar top at y 0, back at z 0
   - v4_팔          the 3-2 single face-out arm + bracket; x centred, bar top at y 0, back at z 0
   - v4_포스터      the poster on the wood panel, cropped from the photo
-  - v4_좌대        the granite plinth under the shoes, a box with a crop of the photo's stone on it
+  - v4_좌대        the granite plinth under the shoes, a box with the photo's stone (front face only, no shoes)
 
     python -X utf8 scripts/vignettes/parts_v4.py
 """
@@ -108,7 +108,14 @@ def main():
     photo = Image.open(PHOTO)  # 2400 x 1800
     poster = photo.crop((873, 370, 1434, 698)).resize((561 * 3, 328 * 3), Image.LANCZOS)
     panel(out("v4_포스터"), poster, 1000, 585, "v4_포스터")
-    stone = photo.crop((1170, 1560, 1380, 1680))  # front face of the plinth, below the shoes' shadow
+    # granite only: a strip of the plinth's front face (the top has the photo's own shoes on it - they would show
+    # through under the 3D shoes), mirrored into a 420 x 240 tile
+    strip = photo.crop((1160, 1680, 1380, 1735))
+    stone = Image.new("RGB", (strip.width * 2, strip.height * 4))
+    for r in range(4):
+        for c in range(2):
+            t = strip.transpose(Image.FLIP_LEFT_RIGHT) if c else strip
+            stone.paste(t.transpose(Image.FLIP_TOP_BOTTOM) if r % 2 else t, (c * strip.width, r * strip.height))
     box(out("v4_좌대"), stone.resize((420, 240), Image.LANCZOS), 450, 320, 420, "v4_좌대")
 
 

@@ -2,10 +2,22 @@
 
 import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
+import { DRACOLoader } from "three/examples/jsm/loaders/DRACOLoader.js";
 import { GLTFLoader, type GLTF } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import type { Placement, SceneFloor, SceneItem, SceneLevel, SceneRack, SceneShot, StoreScene, Swaps, VmdProduct } from "@/lib/scene-types";
+import type {
+  Placement,
+  SceneFixture,
+  SceneFloor,
+  SceneItem,
+  SceneLevel,
+  SceneRack,
+  SceneShot,
+  StoreScene,
+  Swaps,
+  VmdProduct,
+} from "@/lib/scene-types";
 
 /*
  * Store assembled from archisketch floorplan data (docs/store-assembly.md):
@@ -33,8 +45,35 @@ import type { Placement, SceneFloor, SceneItem, SceneLevel, SceneRack, SceneShot
  *   SIDE_SWAP); off shows every garment at its own 3D depth.
  */
 
-/** hanger hook top -> top of the garment on it, m */
-const HANGER_DROP = 0.11;
+/** scene.hanger (부품/옷걸이.glb): width and hook top -> shoulder tips, m */
+const HANGER_W = 0.43;
+const HANGER_TIPS = 0.219;
+/** the hanger's shoulder tips sit this far inside the garment's shoulders, m; the hanger is this share of their width */
+const HANGER_INSET = 0.04;
+const HANGER_SPAN = 0.8;
+/** scene.pantsHanger (부품/바지걸이.glb): clip bar width, hook top -> the waist its clips grip, m; the bar is this
+ * share of the waist width */
+const PANTS_W = 0.32;
+const PANTS_TOP = 0.113;
+const PANTS_SPAN = 0.85;
+/** real height (m, collar / waistband to hem) of a garment per product category (VmdProduct.path[0]). The UniForge3D
+ * product glbs of clothes all come out ~1 m tall whatever they are (a sweatshirt as tall as a long padding), so a
+ * swapped-in garment is scaled to this; shoes, bags, caps, scarves ... are real size already and are left alone. */
+const REAL_HEIGHT: Record<string, number> = {
+  맨투맨: 0.7, 티셔츠: 0.72, 후드티: 0.74, 집업: 0.7, 자켓: 0.74, 스웨터: 0.68, 패딩: 0.74, 패딩베스트: 0.68,
+  팬츠: 1.02, 스커트: 0.8, 원피스: 1.1,
+};
+/** by the style name: 롱 = long (knee and below), 하프 / 미드 = mid-thigh */
+const realHeight = (product: VmdProduct) => {
+  const h = REAL_HEIGHT[product.path[0]];
+  if (!h) return undefined;
+  const name = product.path.join(" ");
+  if (/롱/.test(name) && product.path[0] !== "팬츠") return 1.12;
+  if (/하프|미드/.test(name)) return 0.9;
+  return h;
+};
+/** product categories (VmdProduct.path[0]) that hang on the pants hanger, by the waist */
+const PANTS_CATS = ["팬츠", "스커트"];
 /** pageMemory key of the 옆걸이 촘촘히 setting ("0" = off) */
 const DENSE_KEY = "vmd-dense";
 /** depth share of a side-on swapped product when its slot gives no swapDepth */
@@ -66,6 +105,8 @@ type Engine = {
   setSwap: (itemId: string, product: VmdProduct | null) => void;
   /** outline the slot's item (or the product swapped in for it); null clears */
   highlightSlot: (itemId: string | null) => void;
+  /** outline these slot items in orange (the selected items); [] clears */
+  markSlots: (itemIds: string[]) => void;
   /** image slot: cover the item's front with this image (cropped to fill); null restores the original */
   setPicture: (itemId: string, file: Blob | null, name?: string) => void;
   /** the current view rendered at `width` px with the canvas grade baked in, as a PNG data URL */
@@ -84,9 +125,134 @@ type Engine = {
   setDense: (on: boolean) => void;
   /** box this shelf / rail with what it carries (null clears) */
   highlightLevel: (levelId: string | null) => void;
+  /** 집기: change a fixture's type (option index), place (mm from where it was built) or take it off */
+  setFixture: (fixtureId: string, patch: Partial<FixtureState>) => void;
+  /** 집기: box these fixtures in orange ([] clears) */
+  selectFixture: (fixtureIds: string[]) => void;
+  /** 집기: the bay under a screen point and the height there (mm), for a dropped 도구 */
+  bayAt: (clientX: number, clientY: number) => { bay: string; y: number } | null;
 };
 
+/** a 집기's state: option shown, offset (mm, x y z from where it was built), taken off, shelves / rails of the shown
+ * option taken off (level ids) */
+type FixtureState = { o: number; off: [number, number, number]; rm: boolean; hide?: string[] };
+const FIXTURE_HOME: FixtureState = { o: 0, off: [0, 0, 0], rm: false };
+/** 집기 arrows and drags move in these steps, mm */
+const FIXTURE_STEP = 50;
+const FIXTURE_SNAP = 10;
+
+/** items / racks / levels hidden by the fixtures' state: options not chosen, taken off, or a shelf / rail of the
+ * shown option taken off (with what stands on it and its racks' garments) */
+function fixtureOff(shots: SceneShot[], state: Record<string, FixtureState>) {
+  const items = new Set<string>();
+  const racks = new Set<string>();
+  const levels = new Set<string>();
+  const levelById = new Map(shots.flatMap((s) => (s.levels ?? []).map((l) => [l.id, l] as const)));
+  const slotItem = new Map(shots.flatMap((s) => (s.slots ?? []).map((x) => [x.id, x.itemId] as const)));
+  const rackById = new Map(shots.flatMap((s) => (s.racks ?? []).map((r) => [r.id, r] as const)));
+  for (const f of shots.flatMap((s) => s.fixtures ?? [])) {
+    const s = state[f.id] ?? FIXTURE_HOME;
+    f.options.forEach((o, i) => {
+      if (i === s.o && !s.rm) return;
+      o.itemIds.forEach((x) => items.add(x));
+      o.rackIds.forEach((x) => racks.add(x));
+      o.levelIds.forEach((x) => levels.add(x));
+    });
+    if (s.rm) continue;
+    for (const lid of s.hide ?? []) {
+      const lv = levelById.get(lid);
+      if (!lv || !f.options[s.o]?.levelIds.includes(lid)) continue;
+      levels.add(lid);
+      lv.itemIds.forEach((x) => items.add(x));
+      for (const rid of lv.rackIds ?? []) {
+        racks.add(rid);
+        for (const sid of rackById.get(rid)?.slotIds ?? []) items.add(slotItem.get(sid) ?? "");
+      }
+    }
+  }
+  return { items, racks, levels };
+}
+
 type Anchor = { id: string; u: number; v: number };
+
+/** 집기 도구 (scripts/build_vignettes.py PARTS), in palette order */
+const PART_TYPES = [
+  ["rail", "옆걸이 행거"],
+  ["combo", "옆걸이+정면걸이 행거"],
+  ["shelf", "선반"],
+  ["caps", "모자 진열대"],
+  ["poster", "사진 진열대"],
+  ["goods", "용품 진열"],
+] as const;
+/** the room (mm below / above its height) a piece takes: hung clothes go down, things on a shelf up */
+const PART_BAND: Record<string, [number, number]> = {
+  rail: [-860, 60],
+  combo: [-860, 60],
+  shelf: [-40, 260],
+  caps: [-40, 260],
+  poster: [-40, 860],
+  goods: [-40, 580],
+};
+const PART_MIME = "application/x-vmd-part";
+
+/** line icons of the 집기 도구 (palette, bay list) */
+function PartIcon({ type }: { type: string }) {
+  const common = { width: 26, height: 26, viewBox: "0 0 26 26", fill: "none", stroke: "currentColor", strokeWidth: 1.6, strokeLinecap: "round" as const, strokeLinejoin: "round" as const };
+  switch (type) {
+    case "rail": // a rail with three hangers
+      return (
+        <svg {...common} aria-hidden>
+          <path d="M3 6h20M3 6v-2M23 6v-2" />
+          {[7, 13, 19].map((x) => (
+            <path key={x} d={`M${x} 6v2l-3.5 3.5h7L${x} 8 M${x - 3} 11.5v10h6v-10`} />
+          ))}
+        </svg>
+      );
+    case "combo": // side-hung on a loop + a face-out on the arm right of it
+      return (
+        <svg {...common} aria-hidden>
+          <path d="M2 5h12M2 5v2M14 5v2M16 5h8" />
+          <path d="M5 5v13M9 5v13M3.5 7h3M7.5 7h3" />
+          <path d="M20 5v2l-4 2v12h8V9z" />
+        </svg>
+      );
+    case "shelf": // a board on two brackets
+      return (
+        <svg {...common} aria-hidden>
+          <path d="M3 13h20M3 13v3M23 13v3M6 13v8M20 13v8" />
+          <rect x="7" y="8" width="5" height="5" />
+          <rect x="14" y="9" width="4" height="4" />
+        </svg>
+      );
+    case "caps": // a tipped tray with a cap
+      return (
+        <svg {...common} aria-hidden>
+          <path d="M3 19l20-4M3 19v3M23 15v3" />
+          <path d="M8 15.5a4 4 0 0 1 8-1.6l3 -0.4" />
+        </svg>
+      );
+    case "poster": // a framed photo on a stand
+      return (
+        <svg {...common} aria-hidden>
+          <rect x="4" y="4" width="18" height="13" rx="1" />
+          <path d="M6 15l5-5 4 4 2-2 3 3M3 21h20" />
+          <circle cx="17" cy="8" r="1.4" />
+        </svg>
+      );
+    case "goods": // a backpack and a head with a cap
+      return (
+        <svg {...common} aria-hidden>
+          <path d="M3 21h20" />
+          <rect x="4" y="10" width="8" height="11" rx="2" />
+          <path d="M6 10a2 2 0 0 1 4 0M6 15h4" />
+          <circle cx="18" cy="14" r="3" />
+          <path d="M14.5 12.5a3.5 3 0 0 1 7 0zM18 17v4" />
+        </svg>
+      );
+    default:
+      return <span className="store__iconph" />;
+  }
+}
 
 /** added products / swaps live for the page: they carry across tabs (전체 렌더링 shows
  *  what 3D 매장 보기 added) but a reload starts the store fresh */
@@ -101,6 +267,46 @@ function sharpen(model: THREE.Object3D, anisotropy: number) {
     if (!mesh.isMesh) return;
     for (const m of Array.isArray(mesh.material) ? mesh.material : [mesh.material]) {
       for (const v of Object.values(m)) if (v instanceof THREE.Texture) v.anisotropy = anisotropy;
+    }
+  });
+}
+
+/** VMD product glbs are painted from the official product photo (light and folds already in the texture): drawn
+ * matte (the paint's roughness 0.6 shone orange-brown under the warm store light) and with the canvas grade
+ * (CANVAS_GRADE, for the store's render look) undone in the shader, so a product keeps its photo colour */
+const PRODUCT_ROUGHNESS = 1;
+const PRODUCT_ENV = 0.6;
+const PRODUCT_EXPOSURE = 0.93;
+function photoLook(model: THREE.Object3D) {
+  model.traverse((o) => {
+    const mesh = o as THREE.Mesh;
+    if (!mesh.isMesh) return;
+    for (const m of Array.isArray(mesh.material) ? mesh.material : [mesh.material]) {
+      const std = m as THREE.MeshStandardMaterial;
+      if (!std.isMeshStandardMaterial) continue;
+      std.roughness = PRODUCT_ROUGHNESS;
+      std.metalness = 0;
+      std.envMapIntensity = PRODUCT_ENV;
+      // no AgX: it greys out light colours (a beige came out off-white); PRODUCT_EXPOSURE stands in for its exposure
+      std.toneMapped = false;
+      std.onBeforeCompile = (sh) => {
+        // inverse of saturate(1.5) contrast(1.12) brightness(0.97), last first, on the final sRGB colour
+        sh.fragmentShader = sh.fragmentShader.replace(
+          "#include <colorspace_fragment>",
+          `#include <colorspace_fragment>
+          vec3 ug = gl_FragColor.rgb * ${PRODUCT_EXPOSURE.toFixed(3)} / 0.97;
+          ug = (ug - 0.5) / 1.12 + 0.5;
+          float s = 1.0 / 1.5;
+          mat3 sat = mat3(
+            0.213 + 0.787 * s, 0.213 - 0.213 * s, 0.213 - 0.213 * s,
+            0.715 - 0.715 * s, 0.715 + 0.285 * s, 0.715 - 0.715 * s,
+            0.072 - 0.072 * s, 0.072 - 0.072 * s, 0.072 + 0.928 * s);
+          // and the warm store light (sun 0xfff1e0) taken back out: a white balance that keeps the brightness
+          gl_FragColor.rgb = clamp(sat * ug * vec3(0.985, 1.0, 1.02), 0.0, 1.0);`,
+        );
+      };
+      std.customProgramCacheKey = () => "vmd-photo";
+      std.needsUpdate = true;
     }
   });
 }
@@ -149,9 +355,12 @@ function productTree(products: VmdProduct[]): ProductNode {
   }
   return root;
 }
+const flatProducts = (n: ProductNode): VmdProduct[] => [...n.products, ...n.children.flatMap(flatProducts)];
 const countProducts = (n: ProductNode): number =>
   n.products.length + n.children.reduce((sum, c) => sum + countProducts(c), 0);
-const BADGE_W = 36;
+/** pageMemory key of the right panel shown ("0" = hidden) */
+const PANEL_KEY = "vmd-panel";
+const BADGE_W = 30;
 const BADGE_GAP = 4;
 const PILE_ROW = 6;
 
@@ -163,7 +372,7 @@ function layoutBadges(anchors: Anchor[], w: number, h: number) {
   for (const a of sorted) {
     const pile = piles.find((p) => {
       const last = p[p.length - 1];
-      return (a.u - last.u) * w < BADGE_W && Math.abs(a.v - last.v) * h < 24;
+      return (a.u - last.u) * w < BADGE_W && Math.abs(a.v - last.v) * h < 20;
     });
     if (pile) pile.push(a);
     else piles.push([a]);
@@ -192,7 +401,7 @@ function layoutBadges(anchors: Anchor[], w: number, h: number) {
     for (let moved = true; moved; ) {
       moved = false;
       for (const o of rows.slice(0, i)) {
-        if (Math.abs(o.by - b.by) < 20 && Math.abs(b.bx - o.bx) < BADGE_W + BADGE_GAP) {
+        if (Math.abs(o.by - b.by) < 17 && Math.abs(b.bx - o.bx) < BADGE_W + BADGE_GAP) {
           b.bx = Math.max(b.bx, o.bx) + BADGE_W + BADGE_GAP; // only ever right, so it ends
           moved = true;
         }
@@ -260,15 +469,21 @@ export default function StoreViewer({
   const swapKey = `vmd-swaps:${scene.projectId}`;
   const rackKey = `vmd-racks:${scene.projectId}`;
   const levelKey = `vmd-levels:${scene.projectId}`;
+  const fixtureKey = `vmd-fixtures:${scene.projectId}`;
   const pictureKey = scene.projectId;
+  // 집기 편집: canvas clicks pick / drag fixtures instead of products; the engine reads the ref
+  const fixModeRef = useRef(false);
+  const fixClickRef = useRef<(fixtureId: string | null) => void>(() => {});
   const slotClickRef = useRef<(slotId: string) => void>(() => {});
+  /** a canvas click on nothing (no garment, no shelf): clears the selected items */
+  const emptyClickRef = useRef<() => void>(() => {});
   // slot numbers stay hidden until '상품 표시' is on; the engine reads this for clicks/cursor
   const showSlotsRef = useRef(false);
 
   const [progress, setProgress] = useState({ done: 0, total: 0 });
   const [shot, setShot] = useState<SceneShot | null>(scene.shots[0] ?? null);
   const [compare, setCompare] = useState(false);
-  const [tab, setTab] = useState<"shots" | "products" | "placed">("shots");
+  const [tab, setTab] = useState<"shots" | "products" | "fixtures" | "placed">("shots");
   const [placed, setPlaced] = useState<{ uid: string; name: string }[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -278,6 +493,11 @@ export default function StoreViewer({
   const [rackSides, setRackSides] = useState<Record<string, boolean>>({});
   const [rackHover, setRackHover] = useState<string | null>(null);
   const [levelDys, setLevelDys] = useState<Record<string, number>>({});
+  const [fixState, setFixState] = useState<Record<string, FixtureState>>({});
+  const [fixMode, setFixModeState] = useState(false);
+  const [fixSel, setFixSel] = useState<string | null>(null);
+  const [baySel, setBaySel] = useState<string | null>(null); // 집기 tab: the bay pieces go into
+  const [fixMsg, setFixMsg] = useState<string | null>(null);
   // 옆걸이 촘촘히 - one setting for every page (the engine reads the ref when it starts)
   const [dense, setDenseState] = useState(() => pageMemory.get(DENSE_KEY) !== "0");
   const denseRef = useRef(dense);
@@ -286,8 +506,34 @@ export default function StoreViewer({
   const [stageSize, setStageSize] = useState({ w: 0, h: 0 });
   const [openSlot, setOpenSlot] = useState<string | null>(null);
   const [showSlots, setShowSlots] = useState(false);
+  // selected product slots (click a number / garment = select, again = unselect, several at once); the 상품 tab
+  // then changes all of them
+  const [sel, setSel] = useState<string[]>([]);
+  const [query, setQuery] = useState(""); // 상품 tab search
+  // the right panel (렌더 시점 / 상품) can be hidden for a bigger view; one setting for every page
+  const [panelOpen, setPanelOpenState] = useState(() => pageMemory.get(PANEL_KEY) !== "0");
+  const setPanelOpen = (on: boolean) => {
+    setPanelOpenState(on);
+    pageMemory.set(PANEL_KEY, on ? "1" : "0");
+  };
   showSlotsRef.current = showSlots;
+  fixModeRef.current = fixMode;
+  fixClickRef.current = (id) => pickFixture(id);
   slotClickRef.current = (slotId) => pickSlot(slotId);
+  emptyClickRef.current = () => {
+    if (sel.length) selectSlots([]);
+  };
+  // a click anywhere outside the numbers, the 상품 tab and the toolbars clears the selection (the canvas tells on its own)
+  useEffect(() => {
+    if (!sel.length) return;
+    const onDown = (ev: PointerEvent) => {
+      const t = ev.target as HTMLElement | null;
+      if (!t || t.tagName === "CANVAS" || t.closest(".store__slot, .store__panel, .store__racks, .store__toolbar, .store__swap")) return;
+      selectSlots([]);
+    };
+    document.addEventListener("pointerdown", onDown);
+    return () => document.removeEventListener("pointerdown", onDown);
+  });
 
   useEffect(() => {
     const host = hostRef.current;
@@ -345,11 +591,26 @@ export default function StoreViewer({
     };
 
     const loader = new GLTFLoader();
+    // product web copies are Draco-compressed (scripts/build_product_lite.py); the decoder loads only when one needs it
+    const draco = new DRACOLoader();
+    draco.setDecoderPath("/draco/gltf/");
+    loader.setDRACOLoader(draco);
+    // every model download of this viewer, cancelled when it closes: leaving a tab (the 개요 full store is hundreds
+    // of MB) must not keep the network busy for the next one. A cancelled load never settles - nothing waits on it.
+    const downloads = new AbortController();
+    const fetchGltf = (url: string): Promise<GLTF> =>
+      fetch(url, { signal: downloads.signal })
+        .then((r) => {
+          if (!r.ok) throw new Error(`${r.status} ${url}`);
+          return r.arrayBuffer();
+        })
+        .then((buf) => loader.parseAsync(buf, url.slice(0, url.lastIndexOf("/") + 1)))
+        .catch((err: unknown) => (downloads.signal.aborted ? new Promise<GLTF>(() => {}) : Promise.reject(err)));
     const modelCache = new Map<string, Promise<THREE.Object3D>>();
     const loadModel = (url: string) => {
       let p = modelCache.get(url);
       if (!p) {
-        p = loader.loadAsync(url).then((gltf: GLTF) => {
+        p = fetchGltf(url).then((gltf: GLTF) => {
           sharpen(gltf.scene, anisotropy);
           return gltf.scene;
         });
@@ -366,6 +627,40 @@ export default function StoreViewer({
       done += 1;
       if (!disposed) setProgress({ done, total });
     };
+
+    // 집기: the state saved on this page; items of options not shown are not loaded until someone picks them
+    const fixtures = scene.shots.flatMap((s) => s.fixtures ?? []);
+    const fixState = new Map<string, FixtureState>();
+    try {
+      const saved = JSON.parse(pageMemory.get(fixtureKey) ?? "{}") as Record<string, FixtureState>;
+      for (const f of fixtures) if (saved[f.id]) fixState.set(f.id, saved[f.id]);
+    } catch {
+      /* nothing saved */
+    }
+    let offItems = fixtureOff(scene.shots, Object.fromEntries(fixState)).items;
+    const pendingLoad = new Map<string, () => void>(); // item id -> load its model (shown later)
+    const loadItem = (item: SceneItem, holder: THREE.Group, floor: SceneFloor, counted: boolean) =>
+      loadModel(item.url)
+        .then((model) => {
+          if (disposed) return;
+          const inner = model.clone(true);
+          // library glb loads in metres (node scale 0.001) -> back to mm; custom gltf is mm already
+          if (item.kind === "glb") inner.scale.multiplyScalar(1000);
+          inner.position.set(-item.center[0], -item.center[1], -item.center[2]);
+          inner.userData.inner = true;
+          holder.add(inner);
+          holder.updateMatrixWorld(true);
+          if (item.clip) clipModel(inner, (floor.level + item.clip[0]) / 1000, (floor.level + item.clip[1]) / 1000);
+          itemHolders.push(holder);
+          itemBoxes.set(holder, new THREE.Box3().setFromObject(holder));
+          refit(item.id);
+        })
+        .catch(() => {
+          /* a broken model only leaves a gap */
+        })
+        .finally(() => {
+          if (counted) bump();
+        });
 
     for (const floor of scene.floors) {
       const g = new THREE.Group();
@@ -444,35 +739,21 @@ export default function StoreViewer({
       }
 
       for (const item of floor.items) {
-        total += 1;
         const holder = new THREE.Group();
         holder.matrixAutoUpdate = false;
         holder.matrix.fromArray(item.matrix);
         holder.userData.item = item;
-        holder.visible = !item.renderHidden;
+        holder.visible = !item.renderHidden && !offItems.has(item.id);
         // 전체 렌더링 looks in from above: ceiling-hung lights/structures would cover the store
         if (orbit && item.matrix[13] - item.size[1] / 2 > floor.height * 0.6) holder.visible = false;
         g.add(holder);
         itemById.set(item.id, holder);
-        loadModel(item.url)
-          .then((model) => {
-            if (disposed) return;
-            const inner = model.clone(true);
-            // library glb loads in metres (node scale 0.001) -> back to mm; custom gltf is mm already
-            if (item.kind === "glb") inner.scale.multiplyScalar(1000);
-            inner.position.set(-item.center[0], -item.center[1], -item.center[2]);
-            inner.userData.inner = true;
-            holder.add(inner);
-            holder.updateMatrixWorld(true);
-            if (item.clip) clipModel(inner, (floor.level + item.clip[0]) / 1000, (floor.level + item.clip[1]) / 1000);
-            itemHolders.push(holder);
-            itemBoxes.set(holder, new THREE.Box3().setFromObject(holder));
-            refit(item.id);
-          })
-          .catch(() => {
-            /* a broken model only leaves a gap */
-          })
-          .finally(bump);
+        if (offItems.has(item.id)) {
+          pendingLoad.set(item.id, () => void loadItem(item, holder, floor, false));
+          continue;
+        }
+        total += 1;
+        void loadItem(item, holder, floor, true);
       }
     }
     setProgress({ done, total });
@@ -564,6 +845,23 @@ export default function StoreViewer({
     const selBox = new THREE.BoxHelper(new THREE.Object3D(), 0x1f6feb);
     selBox.visible = false;
     world.add(selBox);
+    /** the selected slot items: one orange box each, refitted every frame */
+    let marked: string[] = [];
+    const markBoxes: THREE.BoxHelper[] = [];
+    const fitMarks = () => {
+      marked.forEach((id, i) => {
+        const target = swapped.get(id) ?? itemById.get(id);
+        let box = markBoxes[i];
+        if (!box) {
+          box = new THREE.BoxHelper(new THREE.Object3D(), 0xf07c12);
+          markBoxes.push(box);
+          world.add(box);
+        }
+        box.visible = !!target?.visible;
+        if (target) box.setFromObject(target);
+      });
+      for (let i = marked.length; i < markBoxes.length; i += 1) markBoxes[i].visible = false;
+    };
 
     const syncPlaced = () => {
       if (disposed) return;
@@ -585,38 +883,46 @@ export default function StoreViewer({
       if (!disposed) setSelected(uid);
     };
 
-    /** a garment glb with its own hook: the top few cm are much narrower than the garment */
-    const hookCache = new Map<string, boolean>();
-    const hasHook = (id: string, root: THREE.Object3D) => {
-      let v = hookCache.get(id);
-      if (v !== undefined) return v;
+    /** a garment's top: does it have its own hook (the top few cm much narrower than the garment), and where are its
+     * shoulders - the first 1 cm band from the top at least 80 % as wide as the widest band of the upper half (m from
+     * the top, and that band's width) */
+    type Shape = { hook: boolean; shoulder: number; width: number; top: number };
+    const shapeCache = new Map<string, Shape>();
+    const garmentShape = (id: string, root: THREE.Object3D): Shape => {
+      const known = shapeCache.get(id);
+      if (known) return known;
       root.updateMatrixWorld(true);
       const box = new THREE.Box3().setFromObject(root);
-      const band = Math.max(0.03, (box.max.y - box.min.y) * 0.04);
-      let lo = Infinity;
-      let hi = -Infinity;
+      const half = Math.ceil((box.max.y - box.min.y) / 2 / 0.01);
+      const lo = new Array<number>(half).fill(Infinity);
+      const hi = new Array<number>(half).fill(-Infinity);
       const p = new THREE.Vector3();
       root.traverse((o) => {
         const pos = (o as THREE.Mesh).isMesh ? (o as THREE.Mesh).geometry.getAttribute("position") : null;
         if (!pos) return;
         for (let i = 0; i < pos.count; i += 1) {
           p.fromBufferAttribute(pos, i).applyMatrix4(o.matrixWorld);
-          if (p.y > box.max.y - band) {
-            lo = Math.min(lo, p.x);
-            hi = Math.max(hi, p.x);
-          }
+          const b = Math.floor((box.max.y - p.y) / 0.01);
+          if (b >= half) continue;
+          lo[b] = Math.min(lo[b], p.x);
+          hi[b] = Math.max(hi[b], p.x);
         }
       });
-      v = hi - lo < (box.max.x - box.min.x) * 0.15;
-      hookCache.set(id, v);
-      return v;
+      const w = lo.map((l, b) => Math.max(0, hi[b] - l));
+      const widest = Math.max(...w, 1e-6);
+      const top = Math.max(w[0], w[1] ?? 0, w[2] ?? 0);
+      const b = Math.max(0, w.findIndex((x) => x >= 0.8 * widest));
+      const shape = { hook: top < (box.max.x - box.min.x) * 0.15, shoulder: b * 0.01, width: w[b], top };
+      shapeCache.set(id, shape);
+      return shape;
     };
 
     const loadProduct = (product: VmdProduct) => {
       let p = productModel.get(product.id);
       if (!p) {
-        p = loader.loadAsync(product.url).then((gltf: GLTF) => {
+        p = fetchGltf(product.url).then((gltf: GLTF) => {
           sharpen(gltf.scene, anisotropy);
+          photoLook(gltf.scene);
           return gltf.scene;
         });
         productModel.set(product.id, p);
@@ -697,6 +1003,34 @@ export default function StoreViewer({
       if (!disposed) setSwaps(out);
     };
     let refit: (itemId: string) => void = () => {}; // a rack garment changed size: keep it inside (set below)
+    /** a hung product reaching past the furniture under its hook (the shelf / rail below an upper rail) is scaled
+     * down, about its hook, to end CLEAR above it - once, when it is hung: moving a shelf later never resizes it */
+    const CLEAR = 0.03;
+    const down = new THREE.Raycaster();
+    const hungIds = new Set(scene.shots.flatMap((x) => (x.slots ?? []).map((y) => y.itemId)));
+    const fitLength = (itemId: string) => {
+      const h = swapped.get(itemId);
+      const g = h?.userData.fitG as THREE.Group | undefined;
+      if (!h || !g) return;
+      g.scale.setScalar(1);
+      h.updateMatrixWorld(true);
+      const hook = h.getWorldPosition(new THREE.Vector3());
+      const bottom = new THREE.Box3().setFromObject(g).min.y;
+      // from just under the hook (past the rail / arm it hangs on), straight down to the first furniture
+      down.set(hook.clone().setY(hook.y - 0.08), new THREE.Vector3(0, -1, 0));
+      let below = -Infinity;
+      for (const holder of itemHolders) {
+        const id = (holder.userData.item as SceneItem | undefined)?.id;
+        if (!holder.visible || (id && hungIds.has(id))) continue;
+        // a fresh box: shelves move (levels), the cached itemBoxes do not follow
+        if (!down.ray.intersectsBox(new THREE.Box3().setFromObject(holder))) continue;
+        const hit = down.intersectObject(holder, true)[0];
+        if (hit && hit.point.y > below) below = hit.point.y;
+      }
+      const room = hook.y - below - CLEAR;
+      const len = hook.y - bottom;
+      if (room > 0.25 && len > room) g.scale.setScalar(room / len);
+    };
     let dense = denseRef.current;
     const sideOf = new Map<string, boolean>(); // rack garment item id -> hung side-on (else face-out), per its rack
     /** the yaw (deg) and depth share a product swapped into this slot gets */
@@ -742,7 +1076,7 @@ export default function StoreViewer({
       }
       const item = original.userData.item as { renderHidden?: boolean };
       if (!product) {
-        original.visible = !item.renderHidden && !rackHidden.has(itemId);
+        original.visible = !item.renderHidden && !rackHidden.has(itemId) && !offItems.has(itemId);
         saveSwaps();
         refit(itemId);
         return;
@@ -752,10 +1086,24 @@ export default function StoreViewer({
       // the slot can say how its products sit (a bag on a shelf stands; hung on a hook it hangs)
       const mount = slotItem.mount ?? product.mount;
       const onHanger =
-        !!scene.hanger && mount === "hang" && product.path[0] !== "가방" && slotItem.fit !== "model" && !hasHook(product.id, src);
-      const hanger = onHanger ? (await loadModel(scene.hanger ?? "")).clone(true) : null;
+        !!scene.hanger &&
+        mount === "hang" &&
+        product.path[0] !== "가방" &&
+        slotItem.fit !== "model" &&
+        !garmentShape(product.id, src).hook;
+      // trousers / skirts by the waist on the clip bar, everything else by the shoulders
+      const pants = onHanger && !!scene.pantsHanger && PANTS_CATS.includes(product.path[0]);
+      const hanger = onHanger ? (await loadModel((pants ? scene.pantsHanger : scene.hanger) ?? "")).clone(true) : null;
       if (disposed || swapping.get(itemId) !== call) return;
       const model = src.clone(true);
+      // clothes to their real length (the glbs are all ~1 m tall); 착장 torsos keep the torso frame
+      let real = 1;
+      const target = slotItem.fit === "model" ? undefined : realHeight(product);
+      if (target) {
+        const full = new THREE.Box3().setFromObject(src);
+        real = target / Math.max(full.max.y - full.min.y, 1e-6);
+        model.scale.multiplyScalar(real);
+      }
       const h = new THREE.Group();
       h.add(model);
       if (slotItem.fit === "model") {
@@ -768,38 +1116,59 @@ export default function StoreViewer({
         const box = new THREE.Box3().setFromObject(model);
         const c = box.getCenter(new THREE.Vector3());
         // hang from the item's hook point (or stand on its base), facing the same way as the item
-        model.position.set(-c.x, mount === "hang" ? -box.max.y - (hanger ? HANGER_DROP : 0) : -box.min.y, -c.z);
-        // hook top at the slot's hook point, the garment's shoulders on it
-        if (hanger) h.add(hanger);
+        model.position.set(-c.x, mount === "hang" ? -box.max.y : -box.min.y, -c.z);
+        if (hanger && pants) {
+          // hook top at the slot's hook point; the bar about as wide as the waist, its clips on the waistband
+          const shape = garmentShape(product.id, src);
+          const k = Math.min(1.4, Math.max(0.8, (PANTS_SPAN * shape.top * real) / PANTS_W));
+          hanger.scale.multiplyScalar(k);
+          model.position.y = -box.max.y - PANTS_TOP * k;
+          h.add(hanger);
+        } else if (hanger) {
+          // hook top at the slot's hook point; the hanger sized to the garment's shoulders, its tips just inside them
+          // (a hood can rise past the hook, as on a real hanger)
+          const shape = garmentShape(product.id, src);
+          const k = Math.min(1.4, Math.max(0.8, (HANGER_SPAN * shape.width * real) / HANGER_W));
+          hanger.scale.multiplyScalar(k);
+          model.position.y = -box.max.y + (shape.shoulder * real + HANGER_INSET - HANGER_TIPS * k);
+          h.add(hanger);
+        }
         const q = new THREE.Quaternion();
         // 매장연출 slots say which way the product faces; otherwise follow the item
         const pose = swapPose(slotItem);
         if (pose.facing !== undefined) q.setFromAxisAngle(new THREE.Vector3(0, 1, 0), (pose.facing * Math.PI) / 180);
         else original.getWorldQuaternion(q);
+        if (slotItem.tilt) q.multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), (slotItem.tilt * Math.PI) / 180));
         h.quaternion.copy(q);
         h.scale.set(1, 1, pose.depth);
         h.position.copy(slotPoint(original, mount === "hang" ? 1 : -1));
       }
       h.userData.productId = product.id;
       h.userData.slotItem = itemId;
+      if (mount === "hang" && slotItem.fit !== "model") {
+        // the garment (+ its hanger) in one group under the hook, for fitLength
+        const g = new THREE.Group();
+        for (const c of [...h.children]) g.add(c);
+        h.add(g);
+        h.userData.fitG = g;
+      }
       const clip = slotItem.clip;
       if (clip) {
         const level = original.parent?.position.y ?? 0; // floor group, mm
         clipModel(model, (level + clip[0]) / 1000, (level + clip[1]) / 1000);
       }
+      h.visible = !offItems.has(itemId); // a 집기 option not shown keeps its products, hidden
       world.add(h);
       swapped.set(itemId, h);
       original.visible = false;
       saveSwaps();
       refit(itemId);
+      fitLength(itemId);
     };
     try {
-      // nothing saved for this page yet: the slots' own products (SceneSlot.product)
-      const kept = pageMemory.get(swapKey);
+      // only what was swapped on this page (a fresh page shows the store's own models)
       const allSlots = scene.shots.flatMap((s) => s.slots ?? []);
-      const saved: Swaps = kept
-        ? (JSON.parse(kept) as Swaps)
-        : Object.fromEntries(allSlots.flatMap((x) => (x.product ? [[x.itemId, x.product] as const] : [])));
+      const saved = JSON.parse(pageMemory.get(swapKey) ?? "{}") as Swaps;
       for (const [itemId, productId] of Object.entries(saved)) {
         const cat = allSlots.find((x) => x.itemId === itemId)?.category;
         const product = productById.get(productId) ?? productById.get(`${cat}/${productId}`);
@@ -817,7 +1186,7 @@ export default function StoreViewer({
     const rackHidden = new Set<string>(); // item ids past their rack's count
     const counts = new Map<string, number>();
     const spots = new Map<string, number[]>(); // rack id -> mm along from -> to of each shown garment
-    const rackDy = new Map<string, number>(); // rack id -> mm its level moved it up
+    const rackShift = new Map<string, THREE.Vector3>(); // rack id -> mm its level / 집기 moved it
     const saveRacks = () => {
       const sideOfRack = (r: SceneRack) => sideOf.get(rackItems(r)[0]) ?? false;
       const out = Object.fromEntries(
@@ -837,7 +1206,7 @@ export default function StoreViewer({
       const a = new THREE.Vector3(...r.from);
       const len = a.distanceTo(new THREE.Vector3(...r.to));
       const dir = len > 0 ? new THREE.Vector3(...r.to).sub(a).divideScalar(len) : new THREE.Vector3();
-      a.y += rackDy.get(r.id) ?? 0; // after dir: a moved rack stays level
+      a.add(rackShift.get(r.id) ?? new THREE.Vector3()); // after dir: a moved rack keeps its direction
       return { a, len, dir };
     };
     // each garment's own drop from the rack line (mixed racks: a padding hangs shorter than trousers), as built
@@ -938,7 +1307,7 @@ export default function StoreViewer({
         }
         rackHidden.delete(itemId);
         putOnRack(r, itemId, ts[i]);
-        holder.visible = !swapped.has(itemId) && !(holder.userData.item as SceneItem).renderHidden;
+        holder.visible = !swapped.has(itemId) && !(holder.userData.item as SceneItem).renderHidden && !offItems.has(itemId);
       });
       fitRack(r);
       saveRacks();
@@ -1010,7 +1379,7 @@ export default function StoreViewer({
       const { len } = rackLine(r);
       if (!parent || len <= 0) return null;
       parent.updateWorldMatrix(true, false);
-      const up = new THREE.Vector3(0, rackDy.get(r.id) ?? 0, 0);
+      const up = rackShift.get(r.id) ?? new THREE.Vector3();
       const a = new THREE.Vector3(...r.from).add(up).applyMatrix4(parent.matrixWorld);
       const b = new THREE.Vector3(...r.to).add(up).applyMatrix4(parent.matrixWorld);
       const lenW = a.distanceTo(b);
@@ -1034,11 +1403,15 @@ export default function StoreViewer({
       }
       if (!disposed) setLevelDys(out);
     };
-    const shiftItem = (itemId: string, d: number) => {
+    /** move an item (and the product swapped in for it) by d mm: a number = up, a vector = any way */
+    const shiftItem = (itemId: string, d: number | THREE.Vector3) => {
       const holder = itemById.get(itemId);
       if (!holder) return;
       const before = holder.getWorldPosition(new THREE.Vector3());
-      holder.matrix.elements[13] += d;
+      const v = typeof d === "number" ? new THREE.Vector3(0, d, 0) : d;
+      holder.matrix.elements[12] += v.x;
+      holder.matrix.elements[13] += v.y;
+      holder.matrix.elements[14] += v.z;
       holder.matrixWorldNeedsUpdate = true; // three 0.18x: a hand-set matrix is not picked up otherwise
       holder.updateWorldMatrix(true, true);
       if (itemBoxes.has(holder)) itemBoxes.set(holder, new THREE.Box3().setFromObject(holder));
@@ -1055,7 +1428,7 @@ export default function StoreViewer({
       for (const rid of lv.rackIds ?? []) {
         const r = racks.find((x) => x.id === rid);
         if (!r) continue;
-        rackDy.set(rid, (rackDy.get(rid) ?? 0) + d);
+        rackShift.set(rid, (rackShift.get(rid) ?? new THREE.Vector3()).clone().add(new THREE.Vector3(0, d, 0)));
         const ts = spots.get(rid) ?? [];
         rackItems(r).slice(0, ts.length).forEach((id, i) => putOnRack(r, id, ts[i]));
       }
@@ -1100,6 +1473,153 @@ export default function StoreViewer({
       }
       rackHelper.visible = !rackBox.isEmpty();
     };
+    // ---------------------------------------------------------------- 집기 (fixtures: type, place, taken off)
+    const fixtureById = new Map(fixtures.map((f) => [f.id, f]));
+    const fixturesOfItem = new Map<string, SceneFixture[]>(); // item id -> its fixtures (a prop inside a bay: both)
+    for (const f of fixtures)
+      for (const o of f.options)
+        for (const id of o.itemIds) {
+          const list = fixturesOfItem.get(id) ?? [];
+          if (!list.includes(f)) list.push(f);
+          fixturesOfItem.set(id, list);
+        }
+    const stateOf = (id: string) => fixState.get(id) ?? FIXTURE_HOME;
+    const saveFixtures = () => {
+      const out = Object.fromEntries(fixState);
+      try {
+        pageMemory.set(fixtureKey, JSON.stringify(out));
+      } catch {
+        /* storage blocked */
+      }
+      if (!disposed) setFixState(out);
+    };
+    /** after a type change / take-off: show and hide items (their swapped products too); a model loads the first
+     * time it shows */
+    const syncFixtureItems = () => {
+      const before = offItems;
+      offItems = fixtureOff(scene.shots, Object.fromEntries(fixState)).items;
+      for (const id of new Set([...before, ...offItems])) {
+        if (before.has(id) === offItems.has(id)) continue;
+        const holder = itemById.get(id);
+        if (!holder) continue;
+        const on = !offItems.has(id);
+        const h = swapped.get(id);
+        if (h) h.visible = on;
+        holder.visible = on && !h && !(holder.userData.item as SceneItem).renderHidden && !rackHidden.has(id);
+        const load = on ? pendingLoad.get(id) : undefined;
+        if (load) {
+          pendingLoad.delete(id);
+          load();
+        }
+      }
+    };
+    /** put a fixture `off` mm from where it was built: every option's items and racks go along */
+    const moveFixture = (f: SceneFixture, off: THREE.Vector3) => {
+      const s = stateOf(f.id);
+      const d = off.clone().sub(new THREE.Vector3(...s.off));
+      if (d.lengthSq() === 0) return;
+      for (const o of f.options) for (const id of o.itemIds) shiftItem(id, d);
+      for (const o of f.options)
+        for (const rid of o.rackIds) {
+          const r = racks.find((x) => x.id === rid);
+          if (!r) continue;
+          rackShift.set(rid, (rackShift.get(rid) ?? new THREE.Vector3()).clone().add(d));
+          const ts = spots.get(rid) ?? [];
+          rackItems(r).slice(0, ts.length).forEach((id, i) => putOnRack(r, id, ts[i]));
+        }
+      fixState.set(f.id, { ...s, off: [off.x, off.y, off.z] });
+    };
+    for (const f of fixtures) {
+      const s = fixState.get(f.id);
+      if (!s?.off.some(Boolean)) continue;
+      fixState.set(f.id, { ...s, off: [0, 0, 0] });
+      moveFixture(f, new THREE.Vector3(...s.off));
+    }
+    if (fixtures.length) saveFixtures();
+    const fixBox = new THREE.Box3();
+    const fixHelper = new THREE.Box3Helper(fixBox, 0xf07c12);
+    fixHelper.visible = false;
+    world.add(fixHelper);
+    let fixSelected: string[] = [];
+    const fitFixtureBox = () => {
+      fixBox.makeEmpty();
+      for (const fid of fixSelected) {
+        const f = fixtureById.get(fid);
+        for (const id of f?.options[stateOf(f.id).o]?.itemIds ?? []) {
+          const o = swapped.get(id) ?? itemById.get(id);
+          if (o && !offItems.has(id) && visibleOf(o)) fixBox.expandByObject(o);
+        }
+      }
+      fixHelper.visible = !fixBox.isEmpty();
+    };
+    /** the fixture under the pointer (a prop before the bay around it) and where the ray met it */
+    const fixtureUnderPointer = () => {
+      raycaster.near = camera.near;
+      let best: { d: number; id: string; p: THREE.Vector3 } | null = null;
+      for (const id of fixturesOfItem.keys()) {
+        if (offItems.has(id)) continue;
+        const o = swapped.get(id) ?? itemById.get(id);
+        if (!o || !visibleOf(o)) continue;
+        const hit = raycaster.intersectObject(o, true)[0];
+        if (hit && (!best || hit.distance < best.d)) best = { d: hit.distance, id, p: hit.point };
+      }
+      if (!best) {
+        // gaps (between side-hung garments, between a shelf and a rail) still pick: the ray through the box of a
+        // shelf / rail with what it carries (that one lifts), else through the whole bay's box
+        const boxOf = (ids: string[]) => {
+          const box = new THREE.Box3();
+          for (const id of ids) {
+            const o = swapped.get(id) ?? itemById.get(id);
+            if (o && !offItems.has(id) && visibleOf(o)) box.expandByObject(o);
+          }
+          return box;
+        };
+        let near: { d: number; f: SceneFixture; p: THREE.Vector3; itemId: string | null; lv: boolean } | null = null;
+        for (const f of fixtures) {
+          const st = stateOf(f.id);
+          if (!(f.tier || f.part) || st.rm || (f.part && st.o === 0)) continue;
+          const o = f.options[st.o];
+          const tries: [string[], string | null][] = (o?.levelIds ?? []).map((lid) => {
+            const lv = levels.find((x) => x.id === lid);
+            const garments = (lv?.rackIds ?? []).flatMap((rid) => {
+              const r = racks.find((x) => x.id === rid);
+              return r ? rackItems(r) : [];
+            });
+            return [[...(lv?.itemIds ?? []), ...garments], lv?.itemIds[0] ?? null];
+          });
+          tries.push([o?.itemIds ?? [], null]);
+          for (const [ids, itemId] of tries) {
+            const box = boxOf(ids);
+            const p = box.isEmpty() ? null : raycaster.ray.intersectBox(box, new THREE.Vector3());
+            if (!p) continue;
+            const d = p.distanceTo(raycaster.ray.origin);
+            // a shelf / rail's own box wins over the bay's when both are hit
+            if (!near || (itemId && !near.lv) || (!!itemId === near.lv && d < near.d)) near = { d, f, p, itemId, lv: !!itemId };
+          }
+        }
+        return near ? { f: near.f, p: near.p, itemId: near.itemId } : null;
+      }
+      const size = (f: SceneFixture) => f.options[stateOf(f.id).o]?.itemIds.length ?? 0;
+      const f = [...(fixturesOfItem.get(best.id) ?? [])].sort((a, b) => size(a) - size(b))[0];
+      return f ? { f, p: best.p, itemId: best.id } : null;
+    };
+    /** the shelf / rail (level) a thing belongs to: the board / rail itself, what stands on it, a garment on its rack */
+    const levelOfItem = (itemId: string | null) => {
+      if (!itemId) return undefined;
+      const rid = rackOf.get(itemId)?.id;
+      return levels.find((l) => l.itemIds.includes(itemId) || (!!rid && !!l.rackIds?.includes(rid)));
+    };
+    let fixDrag: {
+      f: SceneFixture;
+      plane: THREE.Plane;
+      p0: THREE.Vector3;
+      off0: THREE.Vector3;
+      dy0: number;
+      x: number;
+      y: number;
+      moved: boolean;
+    } | null = null;
+
     /** a vertical drag: plane through the grab point facing the camera; y in the level's (floor) mm */
     let lift: { lv: SceneLevel; plane: THREE.Plane; y0: number; dy0: number; parent: THREE.Object3D } | null = null;
     const liftY = () => {
@@ -1109,12 +1629,42 @@ export default function StoreViewer({
     };
 
     let drag: { r: SceneRack; i: number; slot: string; x: number; y: number; moved: boolean } | null = null;
+    // 상품 표시: things standing on a shelf / tray / plinth (caps, shoes, bags, gloves ...) slide left / right
+    const slideKey = `vmd-slide:${scene.projectId}`;
+    const slid = new Map<string, number>(); // item id -> mm moved sideways
+    const SLIDE_CATS = ["모자", "신발", "가방", "장갑", "머플러", "이어워머"];
+    const slidable = (slotId: string | null) => {
+      const sl = slotId ? currentSlots.find((x) => x.id === slotId) : undefined;
+      if (!sl || sl.kind === "image" || rackOf.has(sl.itemId)) return null;
+      const item = itemById.get(sl.itemId)?.userData.item as SceneItem | undefined;
+      if (!item || item.fit === "model") return null;
+      return item.mount === "place" || SLIDE_CATS.includes(sl.category ?? "") ? sl.itemId : null;
+    };
+    const saveSlides = () => {
+      try {
+        pageMemory.set(slideKey, JSON.stringify(Object.fromEntries(slid)));
+      } catch {
+        /* storage blocked */
+      }
+    };
+    try {
+      const saved = JSON.parse(pageMemory.get(slideKey) ?? "{}") as Record<string, number>;
+      for (const [id, dx] of Object.entries(saved)) {
+        if (!dx || !itemById.has(id)) continue;
+        shiftItem(id, new THREE.Vector3(dx, 0, 0));
+        slid.set(id, dx);
+      }
+    } catch {
+      /* nothing saved */
+    }
+    let slide: { id: string; slot: string; plane: THREE.Plane; p0: THREE.Vector3; dx0: number; x: number; y: number; moved: boolean } | null =
+      null;
     const draggable = (slotId: string | null) => {
       const itemId = slotId ? slotItem.get(slotId) : undefined;
       const r = itemId ? rackOf.get(itemId) : undefined;
       return r && rackUnderRay(r) !== null ? { r, i: rackItems(r).indexOf(itemId ?? "") } : null;
     };
-    const shownSlots = () => currentSlots.filter((x) => !rackHidden.has(x.itemId));
+    const shownSlots = () => currentSlots.filter((x) => !rackHidden.has(x.itemId) && !offItems.has(x.itemId));
     const slotAnchorsNow = () => {
       camera.updateMatrixWorld();
       return shownSlots().flatMap((slot) => {
@@ -1188,33 +1738,73 @@ export default function StoreViewer({
     const onPointerDown = (e: PointerEvent) => {
       if (orbit || e.button !== 0) return;
       setPointer(e);
+      if (fixModeRef.current) {
+        // 집기 편집: a click picks the fixture under it, a drag moves it (along the wall / stand, or on the floor)
+        const got = fixtureUnderPointer();
+        fixClickRef.current(got?.f.id ?? null);
+        if (got && (got.f.tier || got.f.part)) {
+          // shelves / rails (as built or put in) only go up / down: whatever is grabbed lifts the one it belongs to
+          const lv = levelOfItem(got.itemId);
+          const parent = got.itemId ? itemById.get(got.itemId)?.parent : null;
+          if (lv && parent) {
+            const n = camera.getWorldDirection(new THREE.Vector3()).setY(0).normalize();
+            lift = {
+              lv,
+              plane: new THREE.Plane().setFromNormalAndCoplanarPoint(n, got.p),
+              y0: 0,
+              dy0: levelDy.get(lv.id) ?? 0,
+              parent,
+            };
+            lift.y0 = liftY() ?? 0;
+            renderer.domElement.setPointerCapture(e.pointerId);
+            highlightLevel(lv.id);
+          }
+          return;
+        }
+        if (got) {
+          const normal = got.f.move === "xz" ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(0, 0, 1);
+          fixDrag = {
+            f: got.f,
+            plane: new THREE.Plane().setFromNormalAndCoplanarPoint(normal, got.p),
+            p0: got.p.clone(),
+            off0: new THREE.Vector3(...stateOf(got.f.id).off),
+            dy0: levelDy.get(got.f.options[1]?.levelIds[0] ?? "") ?? 0,
+            x: e.clientX,
+            y: e.clientY,
+            moved: false,
+          };
+          renderer.domElement.setPointerCapture(e.pointerId);
+        }
+        return;
+      }
       const holders = [...placedMap.values()].map((p) => p.holder);
       const hit = raycaster.intersectObjects(holders, true)[0];
       if (!hit) {
         const slot = showSlotsRef.current ? slotUnderPointer() : null;
         const d = draggable(slot);
+        const sid = slot && !d ? slidable(slot) : null;
         if (slot && d) {
           // a rack garment: a click (no move) still opens it, on pointerup
           drag = { ...d, slot, x: e.clientX, y: e.clientY, moved: false };
           renderer.domElement.setPointerCapture(e.pointerId);
+        } else if (slot && sid) {
+          // a cap / shoe / bag ...: a click selects it (on pointerup), a drag slides it along its shelf
+          const target = swapped.get(sid) ?? itemById.get(sid);
+          const hit = target ? raycaster.intersectObject(target, true)[0] : undefined;
+          const p0 = hit?.point ?? target?.getWorldPosition(new THREE.Vector3()) ?? new THREE.Vector3();
+          slide = {
+            id: sid,
+            slot,
+            plane: new THREE.Plane().setFromNormalAndCoplanarPoint(new THREE.Vector3(0, 0, 1), p0),
+            p0: p0.clone(),
+            dx0: slid.get(sid) ?? 0,
+            x: e.clientX,
+            y: e.clientY,
+            moved: false,
+          };
+          renderer.domElement.setPointerCapture(e.pointerId);
         } else if (slot) slotClickRef.current(slot);
-        else if (showSlotsRef.current) {
-          // a shelf board / rail: lift it
-          const g = levelUnderPointer();
-          if (g?.holder.parent) {
-            const n = camera.getWorldDirection(new THREE.Vector3()).setY(0).normalize();
-            lift = {
-              lv: g.lv,
-              plane: new THREE.Plane().setFromNormalAndCoplanarPoint(n, g.p),
-              y0: 0,
-              dy0: levelDy.get(g.lv.id) ?? 0,
-              parent: g.holder.parent,
-            };
-            lift.y0 = liftY() ?? 0;
-            renderer.domElement.setPointerCapture(e.pointerId);
-            highlightLevel(g.lv.id);
-          }
-        }
+        else if (showSlotsRef.current) emptyClickRef.current(); // shelves / rails move only in 집기 편집
         return;
       }
       let o: THREE.Object3D | null = hit.object;
@@ -1222,13 +1812,10 @@ export default function StoreViewer({
       const entry = o ? placedMap.get(o.userData.uid as string) : undefined;
       if (entry) select(entry.uid);
     };
+    let hoverAt = 0;
     const onPointerMove = (e: PointerEvent) => {
-      if (orbit || !currentSlots.length || !showSlotsRef.current) {
-        renderer.domElement.style.cursor = "";
-        return;
-      }
-      setPointer(e);
       if (lift) {
+        setPointer(e);
         const y = liftY();
         if (y !== null && levelTo(lift.lv, lift.dy0 + y - lift.y0)) {
           highlightLevel(lift.lv.id);
@@ -1236,6 +1823,65 @@ export default function StoreViewer({
           saveLevels();
         }
         renderer.domElement.style.cursor = "ns-resize";
+        return;
+      }
+      if (fixDrag) {
+        if (!fixDrag.moved && Math.hypot(e.clientX - fixDrag.x, e.clientY - fixDrag.y) < 4) return;
+        fixDrag.moved = true;
+        setPointer(e);
+        const p = raycaster.ray.intersectPlane(fixDrag.plane, new THREE.Vector3());
+        if (p) {
+          // world m -> the floor's mm (the store group is mm scaled 1/1000, floors at level 0 here)
+          const d = p.sub(fixDrag.p0).multiplyScalar(1000);
+          const m = fixDrag.f.move;
+          const snap = (v: number) => Math.max(-6000, Math.min(6000, Math.round(v / FIXTURE_SNAP) * FIXTURE_SNAP));
+          const off = fixDrag.off0.clone().add(new THREE.Vector3(d.x, m === "xy" ? d.y : 0, m === "xz" ? d.z : 0));
+          moveFixture(fixDrag.f, new THREE.Vector3(snap(off.x), snap(off.y), snap(off.z)));
+          // a 도구 piece also goes up / down: its level
+          const lv = fixDrag.f.part ? levels.find((x) => x.id === fixDrag?.f.options[1]?.levelIds[0]) : undefined;
+          if (lv && levelTo(lv, fixDrag.dy0 + d.y)) {
+            saveLevels();
+            setAnchors(slotAnchorsNow());
+          }
+          fitFixtureBox();
+        }
+        renderer.domElement.style.cursor = "grabbing";
+        return;
+      }
+      if (fixModeRef.current && !orbit) {
+        const now = performance.now();
+        if (now - hoverAt < 60) return; // a raycast over every fixture item: not on every mouse event
+        hoverAt = now;
+        setPointer(e);
+        const over = fixtureUnderPointer();
+        renderer.domElement.style.cursor = !over
+          ? ""
+          : over.f.tier || over.f.part
+            ? levelOfItem(over.itemId)
+              ? "ns-resize"
+              : "pointer"
+            : "grab";
+        return;
+      }
+      if (orbit || !currentSlots.length || !showSlotsRef.current) {
+        renderer.domElement.style.cursor = "";
+        return;
+      }
+      setPointer(e);
+      if (slide) {
+        if (!slide.moved && Math.hypot(e.clientX - slide.x, e.clientY - slide.y) < 5) return;
+        slide.moved = true;
+        const p = raycaster.ray.intersectPlane(slide.plane, new THREE.Vector3());
+        if (p) {
+          const dx = Math.max(-800, Math.min(800, Math.round((slide.dx0 + (p.x - slide.p0.x) * 1000) / 10) * 10));
+          const d = dx - (slid.get(slide.id) ?? 0);
+          if (d) {
+            shiftItem(slide.id, new THREE.Vector3(d, 0, 0));
+            slid.set(slide.id, dx);
+            setAnchors(slotAnchorsNow());
+          }
+        }
+        renderer.domElement.style.cursor = "grabbing";
         return;
       }
       if (drag) {
@@ -1254,13 +1900,31 @@ export default function StoreViewer({
         return;
       }
       const slot = slotUnderPointer();
-      renderer.domElement.style.cursor = draggable(slot) ? "grab" : slot ? "pointer" : levelUnderPointer() ? "ns-resize" : "";
+      renderer.domElement.style.cursor = draggable(slot) ? "grab" : slidable(slot) ? "ew-resize" : slot ? "pointer" : "";
     };
     const onPointerUp = (e: PointerEvent) => {
+      if (fixDrag) {
+        if (fixDrag.moved) saveFixtures();
+        fixDrag = null;
+        if (renderer.domElement.hasPointerCapture(e.pointerId)) renderer.domElement.releasePointerCapture(e.pointerId);
+        return;
+      }
       if (lift) {
         lift = null;
         highlightLevel(null);
         if (renderer.domElement.hasPointerCapture(e.pointerId)) renderer.domElement.releasePointerCapture(e.pointerId);
+        return;
+      }
+      if (slide) {
+        const { slot, moved } = slide;
+        slide = null;
+        if (renderer.domElement.hasPointerCapture(e.pointerId)) renderer.domElement.releasePointerCapture(e.pointerId);
+        if (!moved) {
+          if (e.type === "pointerup") slotClickRef.current(slot);
+        } else {
+          saveSlides();
+          renderer.domElement.style.cursor = "ew-resize";
+        }
         return;
       }
       if (!drag) return;
@@ -1408,6 +2072,7 @@ export default function StoreViewer({
 
     // ---------------------------------------------------------------- loop
     let raf = 0;
+    let frame = 0;
     let last = performance.now();
     const tick = () => {
       raf = requestAnimationFrame(tick);
@@ -1415,6 +2080,9 @@ export default function StoreViewer({
       moveBy(Math.min((now - last) / 1000, 0.1));
       last = now;
       controls?.update();
+      if (marked.length || markBoxes.some((b) => b.visible)) fitMarks();
+      // the selected 집기's box follows its models as they load in
+      if (fixSelected.length && (frame += 1) % 12 === 0) fitFixtureBox();
       renderer.render(world, camera);
     };
     tick();
@@ -1471,6 +2139,10 @@ export default function StoreViewer({
       setSwap(itemId, product) {
         void setSwap(itemId, product);
       },
+      markSlots(itemIds) {
+        marked = [...itemIds];
+        fitMarks();
+      },
       highlightSlot(itemId) {
         const target = itemId ? (swapped.get(itemId) ?? itemById.get(itemId)) : undefined;
         if (!target) {
@@ -1508,6 +2180,76 @@ export default function StoreViewer({
         }
       },
       highlightLevel,
+      setFixture(fixtureId, patch) {
+        const f = fixtureById.get(fixtureId);
+        if (!f) return;
+        if (patch.off) moveFixture(f, new THREE.Vector3(...patch.off));
+        const s = stateOf(fixtureId);
+        const from = f.options[s.o];
+        const to = patch.o !== undefined ? f.options[patch.o] : undefined;
+        // 좌우 뒤집기: the mirrored option lists the same things in the same order - they keep their state
+        const parallel =
+          !!from && !!to && from !== to && from.kind !== "off" && to.kind !== "off" && from.itemIds.length === to.itemIds.length;
+        const next = {
+          ...s,
+          ...(patch.o !== undefined ? { o: patch.o, hide: [] } : {}),
+          ...(patch.rm !== undefined ? { rm: patch.rm } : {}),
+          ...(patch.hide !== undefined ? { hide: patch.hide } : {}),
+        };
+        if (parallel && from && to)
+          next.hide = (s.hide ?? []).map((lid) => to.levelIds[from.levelIds.indexOf(lid)]).filter((x): x is string => !!x);
+        fixState.set(fixtureId, next);
+        if (next.o !== s.o || next.rm !== s.rm || patch.hide !== undefined || patch.o !== undefined) syncFixtureItems();
+        if (parallel && from && to) {
+          from.levelIds.forEach((lid, i) => {
+            const lv = levels.find((x) => x.id === to.levelIds[i]);
+            if (lv) levelTo(lv, levelDy.get(lid) ?? 0);
+          });
+          from.rackIds.forEach((rid, i) => {
+            const a = racks.find((x) => x.id === rid);
+            const b = racks.find((x) => x.id === to.rackIds[i]);
+            if (!a || !b) return;
+            const side = sideOf.get(rackItems(a)[0]);
+            if (side !== undefined)
+              for (const id of rackItems(b)) {
+                sideOf.set(id, side);
+                const holder = itemById.get(id);
+                if (holder) orient(holder);
+              }
+            spots.delete(b.id);
+            layoutRack(b, counts.get(a.id) ?? a.count);
+          });
+          from.itemIds.forEach((id, i) => {
+            const pid = swapped.get(id)?.userData.productId as string | undefined;
+            const nid = to.itemIds[i];
+            if (pid !== (swapped.get(nid)?.userData.productId as string | undefined))
+              void setSwap(nid, pid ? (productById.get(pid) ?? null) : null);
+          });
+          saveLevels();
+          saveRacks();
+        }
+        fitFixtureBox();
+        saveFixtures();
+      },
+      selectFixture(fixtureIds) {
+        fixSelected = [...fixtureIds];
+        fitFixtureBox();
+      },
+      bayAt(clientX, clientY) {
+        setPointer({ clientX, clientY });
+        let best: { bay: string; y: number; d: number } | null = null;
+        for (const b of scene.shots.flatMap((s) => s.bays ?? [])) {
+          // the bay's face plane (mm -> world m); the point must fall inside its width and height
+          const p = raycaster.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 0, 1), -b.z / 1000), new THREE.Vector3());
+          if (!p) continue;
+          const x = p.x * 1000;
+          const y = p.y * 1000;
+          const d = Math.abs(x - b.x);
+          if (d > b.w / 2 + 60 || y < b.y0 - 200 || y > b.y1 + 200) continue;
+          if (!best || d < best.d) best = { bay: b.id, y: Math.round(y), d };
+        }
+        return best ? { bay: best.bay, y: best.y } : null;
+      },
       setDense(on) {
         dense = on;
         for (const [itemId, h] of swapped) {
@@ -1524,7 +2266,10 @@ export default function StoreViewer({
         const height = Math.round((width * size.y) / size.x);
         const boxOn = selBox.visible;
         const rackOn = rackHelper.visible;
-        selBox.visible = rackHelper.visible = false;
+        const fixOn = fixHelper.visible;
+        const marksOn = markBoxes.map((b) => b.visible);
+        selBox.visible = rackHelper.visible = fixHelper.visible = false;
+        for (const b of markBoxes) b.visible = false;
         renderer.setPixelRatio(1);
         renderer.setSize(width, height, false);
         renderer.render(world, camera);
@@ -1539,6 +2284,8 @@ export default function StoreViewer({
         renderer.setSize(size.x, size.y, false);
         selBox.visible = boxOn;
         rackHelper.visible = rackOn;
+        fixHelper.visible = fixOn;
+        markBoxes.forEach((b, i) => (b.visible = marksOn[i]));
         renderer.render(world, camera);
         return out.toDataURL("image/png");
       },
@@ -1558,10 +2305,18 @@ export default function StoreViewer({
       renderer,
       ceilings,
       debugTop,
+      /** 집기 under a frame point (u, v in 0..1) */
+      fixtureAt(u: number, v: number) {
+        raycaster.setFromCamera(new THREE.Vector2(u * 2 - 1, 1 - v * 2), camera);
+        const got = fixtureUnderPointer();
+        return got ? { id: got.f.id, n: [...fixturesOfItem.keys()].length } : { id: null, n: [...fixturesOfItem.keys()].length };
+      },
     };
 
     return () => {
       disposed = true;
+      downloads.abort();
+      draco.dispose();
       engineRef.current = null;
       cancelAnimationFrame(raf);
       controls?.dispose();
@@ -1576,7 +2331,7 @@ export default function StoreViewer({
       renderer.dispose();
       host.removeChild(renderer.domElement);
     };
-  }, [scene, products, storageKey, swapKey, rackKey, levelKey, pictureKey, orbit]);
+  }, [scene, products, storageKey, swapKey, rackKey, levelKey, fixtureKey, pictureKey, orbit]);
 
   // ---------------------------------------------------------------- UI
   const e = () => engineRef.current;
@@ -1618,18 +2373,54 @@ export default function StoreViewer({
 
   const slotOf = (slotId: string) => shot?.slots?.find((x) => x.id === slotId);
   const badges = layoutBadges(anchors, stageSize.w, stageSize.h);
+  const selectSlots = (ids: string[]) => {
+    setSel(ids);
+    e()?.markSlots(ids.map((id) => slotOf(id)?.itemId).filter((x): x is string => !!x));
+  };
+  /** a number / garment click: an image slot opens its popup; a product slot toggles in the selection and shows the
+   * 상품 tab. null clears both */
   const pickSlot = (slotId: string | null) => {
-    setOpenSlot(slotId);
-    e()?.highlightSlot(slotId ? (slotOf(slotId)?.itemId ?? null) : null);
+    const slot = slotId ? slotOf(slotId) : undefined;
+    if (!slotId || slot?.kind === "image") {
+      setOpenSlot(slotId);
+      e()?.highlightSlot(slot ? slot.itemId : null);
+      if (!slotId) selectSlots([]);
+      return;
+    }
+    setOpenSlot(null);
+    e()?.highlightSlot(null);
+    selectSlots(sel.includes(slotId) ? sel.filter((x) => x !== slotId) : [...sel, slotId]);
+    setTab("products");
+    if (!panelOpen) setPanelOpen(true); // a selected item is changed from the 상품 tab
+  };
+  /** every product number on screen now (shown garments), for 모두 선택 */
+  const productBadgeIds = showSlots ? badges.map((b) => b.id).filter((id) => slotOf(id)?.kind !== "image") : [];
+  // every word of the search in the product's folders / file name / colour (case-insensitive)
+  const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const searched = words.length
+    ? products.filter((p) => {
+        const hay = [...p.path, p.id, p.name, p.color ?? ""].join(" ").toLowerCase();
+        return words.every((w) => hay.includes(w));
+      })
+    : products;
+  const selSlots = sel.map(slotOf).filter((x): x is NonNullable<typeof x> => !!x);
+  const selCats = [...new Set(selSlots.map((x) => x.category).filter((x): x is string => !!x))];
+  const selRackItems = selSlots.filter((x) => (shot?.racks ?? []).some((r) => r.slotIds.includes(x.id)));
+  const applyProduct = (p: VmdProduct | null) => {
+    for (const x of selSlots) e()?.setSwap(x.itemId, p);
   };
   const open = openSlot ? slotOf(openSlot) : undefined;
   const openBadge = badges.find((a) => a.id === openSlot);
   const productName = (id: string | undefined) => products.find((p) => p.id === id)?.name;
-  const choices = open?.category ? products.filter((p) => p.path[0] === open.category) : products;
-  const shotRacks = shot?.racks ?? [];
+  // racks / levels / slots of 집기 types not shown (or taken off) leave the bars and the counts
+  const shotFixtures = shot?.fixtures ?? [];
+  const fixOff = fixtureOff(shot ? [shot] : [], fixState);
+  const shotRacks = (shot?.racks ?? []).filter((r) => !fixOff.racks.has(r.id));
   const countOf = (r: SceneRack) => rackCounts[r.id] ?? r.count;
   const openRack = open ? shotRacks.find((r) => r.slotIds.includes(open.id)) : undefined;
-  const shownSlotCount = (shot?.slots?.length ?? 0) - shotRacks.reduce((n, r) => n + r.slotIds.length - countOf(r), 0);
+  const shownSlotCount =
+    (shot?.slots ?? []).filter((x) => !fixOff.items.has(x.itemId)).length -
+    shotRacks.reduce((n, r) => n + r.slotIds.length - countOf(r), 0);
   // the label says how it hangs now (옆걸이 / 정면걸이), after the per-rack switch
   const rackLabel = (r: SceneRack) =>
     rackSides[r.id] === undefined ? r.label : r.label.replace(/옆걸이|정면걸이/, rackSides[r.id] ? "옆걸이" : "정면걸이");
@@ -1639,7 +2430,7 @@ export default function StoreViewer({
     setRackHover(r?.id ?? null);
     e()?.highlightRack(r?.id ?? null);
   };
-  const shotLevels = shot?.levels ?? [];
+  const shotLevels = (shot?.levels ?? []).filter((l) => !fixOff.levels.has(l.id));
   const levelGroups = [...new Set(shotLevels.map((l) => l.group ?? ""))];
   const levelDyOf = (l: SceneLevel) => levelDys[l.id] ?? 0;
   const moveLevel = (l: SceneLevel, dy: number) => {
@@ -1653,6 +2444,234 @@ export default function StoreViewer({
     setAnchors(e()?.slotAnchors() ?? []);
   };
 
+  // ---------------------------------------------------------------- 집기 (fixtures)
+  const fixStateOf = (id: string) => fixState[id] ?? FIXTURE_HOME;
+  const shotBays = shot?.bays ?? [];
+  const selFix = shotFixtures.find((f) => f.id === fixSel);
+  const levelById = (id: string | undefined) => (shot?.levels ?? []).find((l) => l.id === id);
+  /** a 도구 piece's one shelf / rail */
+  const partLevel = (f: SceneFixture) => levelById(f.options[Math.max(1, fixStateOf(f.id).o)]?.levelIds[0]);
+  const bayFixtures = (bay: string) => shotFixtures.filter((f) => f.group === bay && (f.tier || f.part));
+  const bayParts = (bay: string) => shotFixtures.filter((f) => f.part?.bay === bay);
+  const props = shotFixtures.filter((f) => !f.tier && !f.part);
+  /** 집기 편집 on: canvas clicks pick fixtures (the product numbers go away); off: back to products */
+  const setFixMode = (on: boolean) => {
+    setFixModeState(on);
+    if (on) {
+      setShowSlots(false);
+      pickSlot(null);
+      setTab("fixtures");
+      if (!panelOpen) setPanelOpen(true);
+    }
+  };
+  /** what is shown in the bay now (zones as built + pieces put in): boxed when the bay is picked */
+  const bayShown = (bay: string) =>
+    bayFixtures(bay)
+      .filter((f) => (f.part ? fixStateOf(f.id).o > 0 : !fixStateOf(f.id).rm))
+      .map((f) => f.id);
+  const pickFixture = (id: string | null) => {
+    const f = shotFixtures.find((x) => x.id === id);
+    setFixMsg(null);
+    setFixSel(f ? f.id : null);
+    setBaySel(f ? (f.part?.bay ?? (f.tier ? f.group : null)) : null);
+    e()?.selectFixture(f ? [f.id] : []);
+    if (f) {
+      setTab("fixtures");
+      if (!panelOpen) setPanelOpen(true);
+    }
+  };
+  const pickBay = (bay: string | null) => {
+    setFixMsg(null);
+    setFixSel(null);
+    setBaySel(bay);
+    e()?.selectFixture(bay ? bayShown(bay) : []);
+  };
+  const changeFixture = (id: string, patch: Partial<FixtureState>) => {
+    selectSlots([]);
+    e()?.setFixture(id, patch);
+    setAnchors(e()?.slotAnchors() ?? []);
+  };
+  const nudgeFixture = (f: SceneFixture, dx: number, dy: number, dz: number) => {
+    const o = fixStateOf(f.id).off;
+    changeFixture(f.id, { off: [o[0] + dx, o[1] + dy, o[2] + dz] });
+  };
+  const fixChanged = (f: SceneFixture) => {
+    const st = fixStateOf(f.id);
+    return f.part ? st.o > 0 : st.o !== 0 || st.rm || st.off.some(Boolean) || !!st.hide?.length;
+  };
+  const resetFixtures = () => {
+    for (const f of shotFixtures) if (fixChanged(f)) changeFixture(f.id, { o: 0, off: [0, 0, 0], rm: false, hide: [] });
+    pickBay(baySel);
+  };
+  /** how far up / down (mm, from its height) a shelf / rail and what it carries take room */
+  const bandOf = (lid: string): [number, number] => {
+    const part = shotFixtures.find((f) => f.part && f.options.some((o) => o.levelIds.includes(lid)))?.part;
+    if (part) return PART_BAND[part.type] ?? [-40, 300];
+    const lv = levelById(lid);
+    // a shelf with a rail under it: the clothes hang down, what stands on it (heads, bags) goes up
+    if (lv?.rackIds?.length) return lv.itemIds.length > 1 ? [PART_BAND.rail[0], 560] : PART_BAND.rail;
+    return [-40, 320];
+  };
+  /** taken heights in a bay now: its shelves / rails as built (not taken off) + pieces put in + racks off any shelf */
+  const bayTaken = (bay: string, skip?: string) => {
+    const out: [number, number][] = [];
+    for (const f of bayFixtures(bay)) {
+      const st = fixStateOf(f.id);
+      if (f.id === skip || st.rm || (f.part && st.o === 0)) continue;
+      const o = f.options[st.o];
+      for (const lid of o?.levelIds ?? []) {
+        const lv = levelById(lid);
+        if (!lv || st.hide?.includes(lid)) continue;
+        const y = lv.y + (levelDys[lid] ?? 0);
+        const [a, b] = bandOf(lid);
+        out.push([y + a, y + b]);
+      }
+      const inLevel = new Set((o?.levelIds ?? []).flatMap((lid) => levelById(lid)?.rackIds ?? []));
+      for (const rid of o?.rackIds ?? []) {
+        const r = (shot?.racks ?? []).find((x) => x.id === rid);
+        if (r && !inLevel.has(rid)) out.push([r.from[1] + PART_BAND.rail[0], r.from[1] + PART_BAND.rail[1]]);
+      }
+    }
+    return out;
+  };
+  /** the highest height where a piece of this type fits between what is already in the bay */
+  const freeHeight = (bay: string, f: SceneFixture, lv: SceneLevel) => {
+    const [a, b] = PART_BAND[f.part?.type ?? ""] ?? [-40, 300];
+    const taken = bayTaken(bay, f.id);
+    for (let y = lv.max; y >= lv.min; y -= 10) if (taken.every(([lo, hi]) => y + b + 20 <= lo || y + a - 20 >= hi)) return y;
+    return null;
+  };
+  /** put a 도구 piece in a bay: the next one of the pool not there yet, at `y` (dropped) or the highest free height */
+  const addPart = (type: string, bay: string, y?: number) => {
+    const f = bayParts(bay).find((x) => x.part?.type === type && fixStateOf(x.id).o === 0);
+    const label = PART_TYPES.find(([t]) => t === type)?.[1] ?? type;
+    if (!f) {
+      setFixMsg(`${bay}에는 ${label}을(를) 더 넣을 수 없어요 (최대 ${bayParts(bay).filter((x) => x.part?.type === type).length}개).`);
+      return;
+    }
+    const lv = partLevel(f);
+    changeFixture(f.id, { o: 1, off: [0, 0, 0] });
+    if (lv) {
+      // no free height: hung pieces go to the top, the others to the middle
+      const hung = PART_BAND[type]?.[0] < -500;
+      const at = y !== undefined ? Math.min(Math.max(y, lv.min), lv.max) : (freeHeight(bay, f, lv) ?? (hung ? lv.max : (lv.min + lv.max) / 2));
+      e()?.setLevel(lv.id, at - lv.y);
+      e()?.highlightLevel(null);
+      setAnchors(e()?.slotAnchors() ?? []);
+      if (y === undefined && freeHeight(bay, f, lv) === null) setFixMsg(`${bay}에 빈 높이가 없어 겹치게 넣었어요. 다른 집기를 빼거나 높이를 옮겨 주세요.`);
+      else setFixMsg(null);
+    }
+    setFixSel(f.id);
+    setBaySel(bay);
+    e()?.selectFixture([f.id]);
+  };
+  const removePart = (f: SceneFixture) => {
+    changeFixture(f.id, { o: 0, off: [0, 0, 0] });
+    if (fixSel === f.id) pickBay(f.part?.bay ?? null);
+  };
+  const clearBay = (bay: string) => {
+    for (const f of bayFixtures(bay)) changeFixture(f.id, f.part ? { o: 0 } : { rm: true });
+    pickBay(bay);
+  };
+  const resetBay = (bay: string) => {
+    for (const f of bayFixtures(bay)) if (fixChanged(f)) changeFixture(f.id, { o: 0, off: [0, 0, 0], rm: false, hide: [] });
+    pickBay(bay);
+  };
+  const offText = (off: [number, number, number]) => {
+    const parts = [
+      off[0] ? `${off[0] > 0 ? "오른쪽" : "왼쪽"} ${Math.abs(off[0]) / 10}cm` : "",
+      off[1] ? `${off[1] > 0 ? "위" : "아래"} ${Math.abs(off[1]) / 10}cm` : "",
+      off[2] ? `${off[2] > 0 ? "앞" : "뒤"} ${Math.abs(off[2]) / 10}cm` : "",
+    ].filter(Boolean);
+    return parts.length ? parts.join(" · ") : "제자리";
+  };
+  const partLeft = (bay: string, type: string) =>
+    bayParts(bay).filter((x) => x.part?.type === type && fixStateOf(x.id).o === 0).length;
+  /** the bay's contents, top first: shelves / rails as built (each can come off) and pieces put in */
+  const bayRows = (bay: string) => {
+    type Row = {
+      key: string;
+      label: string;
+      y: number | null;
+      type?: string;
+      on: boolean;
+      act: () => void;
+      pick?: () => void;
+      lv?: SceneLevel;
+      /** 좌우 뒤집기 (옆걸이+정면걸이 hangers) and whether it is flipped now */
+      flip?: () => void;
+      flipped?: boolean;
+    };
+    const rows: Row[] = [];
+    for (const f of bayFixtures(bay)) {
+      const st = fixStateOf(f.id);
+      if (f.part) {
+        const lv = partLevel(f);
+        if (st.o === 0) continue;
+        const canFlip = f.options.length > 2;
+        rows.push({
+          key: f.id,
+          label: f.label,
+          y: lv ? lv.y + (levelDys[lv.id] ?? 0) : null,
+          type: f.part.type,
+          on: true,
+          lv,
+          flip: canFlip ? () => changeFixture(f.id, { o: st.o === 1 ? 2 : 1 }) : undefined,
+          flipped: st.o === 2,
+          act: () => removePart(f),
+          pick: () => pickFixture(f.id),
+        });
+        continue;
+      }
+      if (st.rm) {
+        rows.push({ key: f.id, label: `${f.label} 원래 집기`, y: null, on: false, act: () => changeFixture(f.id, { rm: false }) });
+        continue;
+      }
+      const lids = f.options[st.o]?.levelIds ?? [];
+      const flipAt = f.options.findIndex((o) => o.kind === "flip");
+      const zoneFlip = flipAt > 0 ? () => changeFixture(f.id, { o: st.o === flipAt ? 0 : flipAt }) : undefined;
+      let flipShown = false;
+      for (const lid of lids) {
+        const lv = levelById(lid);
+        const off = !!st.hide?.includes(lid);
+        rows.push({
+          key: lid,
+          label: `${lv?.label ?? lid}${f.label !== bay ? ` (${f.label})` : ""}`,
+          y: lv ? lv.y + (levelDys[lid] ?? 0) : null,
+          type: lv?.fixed ? "combo" : lv?.rackIds?.length ? "rail" : "shelf",
+          on: !off,
+          lv: off ? undefined : lv,
+          ...(lv?.fixed && zoneFlip && !off ? ((flipShown = true), { flip: zoneFlip, flipped: st.o === flipAt }) : {}),
+          act: () => changeFixture(f.id, { hide: off ? (st.hide ?? []).filter((x) => x !== lid) : [...(st.hide ?? []), lid] }),
+          pick: () => {
+            setFixSel(null);
+            e()?.selectFixture([]);
+            e()?.highlightLevel(lid);
+          },
+        });
+      }
+      // what stands outside any shelf (loops, arms, posters): off only with the whole zone
+      const inLevels = new Set(lids.flatMap((lid) => levelById(lid)?.itemIds ?? []));
+      const rackItems = new Set(
+        (f.options[st.o]?.rackIds ?? []).flatMap((rid) =>
+          ((shot?.racks ?? []).find((r) => r.id === rid)?.slotIds ?? []).map((sid) => slotOf(sid)?.itemId),
+        ),
+      );
+      const loose = (f.options[st.o]?.itemIds ?? []).filter((id) => !inLevels.has(id) && !rackItems.has(id));
+      const looseRacks = (f.options[st.o]?.rackIds ?? []).filter((rid) => !lids.some((lid) => levelById(lid)?.rackIds?.includes(rid)));
+      if (loose.length || looseRacks.length)
+        rows.push({
+          key: `${f.id}-rest`,
+          label: lids.length ? `${f.label} 나머지 (고리·팔·포스터 등)` : `${f.label} 집기`,
+          y: null,
+          on: true,
+          ...(zoneFlip && !flipShown ? ((flipShown = true), { flip: zoneFlip, flipped: st.o === flipAt, type: "combo" }) : {}),
+          act: () => changeFixture(f.id, { rm: true }),
+          pick: () => pickFixture(f.id),
+        });
+    }
+    return rows.sort((a, b) => (b.y ?? 3000) - (a.y ?? 3000));
+  };
   if (orbit) {
     return (
       <div className="store">
@@ -1748,13 +2767,29 @@ export default function StoreViewer({
               checked={showSlots}
               onChange={(ev) => {
                 setShowSlots(ev.target.checked);
+                if (ev.target.checked) setFixMode(false);
                 if (!ev.target.checked) pickSlot(null);
               }}
             />
             상품 표시 ({shownSlotCount})
           </label>
         )}
+        {shotFixtures.length > 0 && (
+          <label className="store__check" title="집기(선반·행거·소도구)를 눌러 고르고, 끌어서 옮기고, 타입을 바꾸거나 뺍니다">
+            <input type="checkbox" checked={fixMode} onChange={(ev) => setFixMode(ev.target.checked)} />
+            집기 편집
+          </label>
+        )}
         <span className="filterbar__spacer" />
+        <button
+          type="button"
+          className="btn btn--sm"
+          aria-pressed={!panelOpen}
+          title={panelOpen ? "오른쪽 렌더 시점·상품 패널을 숨기고 화면만 크게 봅니다" : "렌더 시점·상품 패널을 다시 엽니다"}
+          onClick={() => setPanelOpen(!panelOpen)}
+        >
+          {panelOpen ? "패널 숨기기 ▶" : "◀ 패널 보이기"}
+        </button>
         <button type="button" className="btn btn--sm" disabled={loading} onClick={saveImage} title={`지금 화면을 ${SNAPSHOT_W}px PNG 로 저장`}>
           고화질 저장
         </button>
@@ -1812,7 +2847,7 @@ export default function StoreViewer({
         </div>
       )}
 
-      {showSlots && shotLevels.length > 0 && (
+      {fixMode && shotLevels.length > 0 && (
         <div className="store__racks" aria-label="선반·봉 높이" onMouseLeave={() => e()?.highlightLevel(null)}>
           <span className="muted">선반·봉 높이</span>
           {levelGroups.map((g) => (
@@ -1859,7 +2894,25 @@ export default function StoreViewer({
       <div className="store__main">
         <div className="store__stagewrap">
         {/* a render shot fixes the frame to its own aspect, so 렌더 비교 overlays 1:1 */}
-        <div ref={stageRef} className="store__stage" style={{ ["--ar" as string]: String(shot ? shot.aspect : 16 / 9) }}>
+        <div
+          ref={stageRef}
+          className="store__stage"
+          style={{ ["--ar" as string]: String(shot ? shot.aspect : 16 / 9) }}
+          onDragOver={(ev) => {
+            if (!ev.dataTransfer.types.includes(PART_MIME)) return;
+            ev.preventDefault();
+            ev.dataTransfer.dropEffect = "copy";
+          }}
+          onDrop={(ev) => {
+            const type = ev.dataTransfer.getData(PART_MIME);
+            if (!type) return;
+            ev.preventDefault();
+            if (!fixMode) setFixMode(true);
+            const at = e()?.bayAt(ev.clientX, ev.clientY);
+            if (at) addPart(type, at.bay, at.y);
+            else setFixMsg("칸(벽판·행거) 위에 놓아 주세요.");
+          }}
+        >
           <div ref={hostRef} className="store__canvas" />
           {compare && shot?.thumb && (
             // eslint-disable-next-line @next/next/no-img-element
@@ -1872,16 +2925,6 @@ export default function StoreViewer({
               </div>
             </div>
           )}
-          {showSlots && !compare && badges.length > 0 && (
-            <svg className="store__leaders" width={stageSize.w} height={stageSize.h}>
-              {badges.map((b) => (
-                <g key={b.id} className={openSlot === b.id ? "on" : ""}>
-                  <line x1={b.bx} y1={b.by + 9} x2={b.ax} y2={b.ay} />
-                  <circle cx={b.ax} cy={b.ay} r={2.5} />
-                </g>
-              ))}
-            </svg>
-          )}
           {showSlots &&
             !compare &&
             badges.map((b) => {
@@ -1892,16 +2935,17 @@ export default function StoreViewer({
                 <button
                   key={b.id}
                   type="button"
-                  className={`store__slot${openSlot === b.id ? " store__slot--on" : ""}${swappedTo ? " store__slot--swapped" : ""}${inHover ? " store__slot--rack" : ""}`}
+                  className={`store__slot${openSlot === b.id ? " store__slot--on" : ""}${sel.includes(b.id) ? " store__slot--sel" : ""}${swappedTo ? " store__slot--swapped" : ""}${inHover ? " store__slot--rack" : ""}`}
                   style={{ left: b.bx, top: b.by }}
                   title={swappedTo ? `${b.id} → ${swappedTo}` : `${b.id} ${slot?.kind === "image" ? "이미지" : "상품"} 변경`}
                   onClick={() => pickSlot(openSlot === b.id ? null : b.id)}
+                  aria-pressed={sel.includes(b.id)}
                 >
                   {b.id}
                 </button>
               );
             })}
-          {open && openBadge && (
+          {open && open.kind === "image" && openBadge && (
             <div
               className="store__swap"
               style={{
@@ -1916,8 +2960,6 @@ export default function StoreViewer({
                   ×
                 </button>
               </div>
-              {open.kind === "image" ? (
-                <>
                   <div className="store__swaptitle">이미지 변경</div>
                   {pictures[open.itemId] && <div className="store__swapfile">{pictures[open.itemId]}</div>}
                   <label className="btn btn--sm btn--accent" style={{ width: "100%", justifyContent: "center" }}>
@@ -1948,77 +2990,20 @@ export default function StoreViewer({
                   >
                     원래 이미지로
                   </button>
-                </>
-              ) : (
-              <>
-              <div className="store__swaptitle">상품 변경</div>
-              {choices.length === 0 && (
-                <div className="muted" style={{ fontSize: 11.5, lineHeight: 1.5 }}>
-                  아직 {open.category} 상품이 없습니다. 상품/{open.category} 폴더에 glb 를 넣으면 여기에 뜹니다.
-                </div>
-              )}
-              {choices.map((p, i) => (
-                <div key={p.id}>
-                {p.path.join("/") !== choices[i - 1]?.path.join("/") && (
-                  <div className="store__swapgroup">{p.path.join(" / ")}</div>
-                )}
-                <button
-                  key={p.id}
-                  type="button"
-                  className={`store__swapitem${swaps[open.itemId] === p.id ? " store__swapitem--on" : ""}`}
-                  onClick={() => {
-                    e()?.setSwap(open.itemId, p);
-                    pickSlot(null);
-                  }}
-                >
-                  {p.thumb && (
-                    // eslint-disable-next-line @next/next/no-img-element
-                    <img src={p.thumb} alt="" />
-                  )}
-                  <span>{p.color ?? p.name}</span>
-                </button>
-                </div>
-              ))}
-              <button
-                type="button"
-                className="btn btn--sm"
-                disabled={!swaps[open.itemId]}
-                style={{ marginTop: 6, width: "100%" }}
-                onClick={() => {
-                  e()?.setSwap(open.itemId, null);
-                  pickSlot(null);
-                }}
-              >
-                원래 상품으로
-              </button>
-              {openRack && (
-                <button
-                  type="button"
-                  className="btn btn--sm"
-                  style={{ marginTop: 6, width: "100%" }}
-                  onClick={() => changeRack(() => e()?.removeFromRack(open.itemId))}
-                >
-                  이 옷 빼기 ({rackName(openRack)} {countOf(openRack)} → {countOf(openRack) - 1})
-                </button>
-              )}
-              </>
-              )}
             </div>
           )}
-          <div className="store__help">
-            시점 고정 &nbsp;|&nbsp; 상품 표시 → 번호·옷 클릭 = 상품 변경 · 위 −/+ 로 걸이별 옷 개수 · 옆걸이 옷은 좌우로 끌어 옮기기 · 선반·봉은 ▲▼ 또는 위아래로 끌기 &nbsp;|&nbsp; 사진 파일 → 포스터·TV에 끌어다 놓기 &nbsp;|&nbsp; 추가한 상품: 클릭 선택 · <b>Q/E</b> 회전 · <b>Z/X</b> 높이 · <b>Del</b> 삭제
-          </div>
         </div>
         </div>
 
-        <aside className="store__panel">
+        {panelOpen && (
+        <aside className={`store__panel${tab === "products" || tab === "fixtures" ? " store__panel--wide" : ""}`}>
           <div className="store__tabs">
             {(
               [
                 ["shots", `렌더 시점 ${scene.shots.length}`],
                 ["products", "상품"],
-                ["placed", `배치 ${placed.length}`],
-              ] as const
+                ...(shotFixtures.length ? [["fixtures", "집기"]] : []),
+              ] as [typeof tab, string][]
             ).map(([key, label]) => (
               <button
                 key={key}
@@ -2029,6 +3014,15 @@ export default function StoreViewer({
                 {label}
               </button>
             ))}
+            <button
+              type="button"
+              className="store__tab store__panelx"
+              aria-label="패널 숨기기"
+              title="패널 숨기기 (화면만 크게)"
+              onClick={() => setPanelOpen(false)}
+            >
+              ▶
+            </button>
           </div>
 
           {tab === "shots" && (
@@ -2067,18 +3061,256 @@ export default function StoreViewer({
                 <div className="muted">상품 폴더(data/vmd-products.json 의 root)에 glb 가 없습니다.</div>
               )}
               {products.length > 0 && (
-                <ProductFolder
-                  node={productTree(products)}
-                  depth={0}
-                  onAdd={(p) => {
-                    e()?.addProduct(p);
-                    setTab("placed");
-                  }}
-                />
+                <div className="store__pickbar">
+                <div className="store__search">
+                  <input
+                    type="search"
+                    value={query}
+                    placeholder="상품 검색 (스타일명·품번·컬러, 띄어쓰기 = 모두 포함)"
+                    aria-label="상품 검색"
+                    onChange={(ev) => setQuery(ev.target.value)}
+                  />
+                  {query && (
+                    <span className="muted">
+                      {searched.length}개
+                    </span>
+                  )}
+                </div>
+
+                  {sel.length ? (
+                    <>
+                      <span>
+                        선택한 아이템 <b>{sel.join(" · ")}</b>
+                      </span>
+                      <span className="muted">상품을 누르면 선택한 {sel.length}개가 모두 그 상품으로 바뀝니다</span>
+                      <span className="store__pickbtns">
+                        <button type="button" className="btn btn--sm" onClick={() => applyProduct(null)}>
+                          원래 상품으로
+                        </button>
+                        {selRackItems.length > 0 && (
+                          <button
+                            type="button"
+                            className="btn btn--sm"
+                            onClick={() => changeRack(() => selRackItems.forEach((x) => e()?.removeFromRack(x.itemId)))}
+                          >
+                            옷 빼기 {selRackItems.length}
+                          </button>
+                        )}
+                        <button type="button" className="btn btn--sm" onClick={() => selectSlots(productBadgeIds)}>
+                          모두 선택
+                        </button>
+                        <button type="button" className="btn btn--sm" onClick={() => selectSlots([])}>
+                          선택 해제
+                        </button>
+                      </span>
+                    </>
+                  ) : (
+                    <span className="muted">
+                      {showSlots && productBadgeIds.length > 0 && (
+                        <button type="button" className="btn btn--sm" style={{ float: "right" }} onClick={() => selectSlots(productBadgeIds)}>
+                          모두 선택
+                        </button>
+                      )}
+                      {showSlots ? "화면에서 번호나 옷을 눌러 아이템을 고르세요 (여러 개 가능)" : "위 '상품 표시'를 켜고 번호나 옷을 눌러 아이템을 고르세요"}
+                    </span>
+                  )}
+                </div>
               )}
-              <p className="muted" style={{ fontSize: 11.5, lineHeight: 1.5 }}>
-                화면 가운데가 가리키는 바닥·선반·행거에 놓입니다 (끌어서 옮기기는 없음).
-              </p>
+              {query && searched.length === 0 && <div className="muted">'{query}' 에 맞는 상품이 없습니다.</div>}
+              {[...productTree(searched).children]
+                .sort((a, b) => Number(selCats.includes(b.name)) - Number(selCats.includes(a.name)))
+                .map((c) => (
+                  <ProductFolder
+                    key={`${c.name}|${selCats.join()}|${query ? "q" : ""}`}
+                    node={c}
+                    open={!!query || !selCats.length || selCats.includes(c.name)}
+                    current={selSlots.map((x) => swaps[x.itemId]).filter((x): x is string => !!x)}
+                    onPick={sel.length ? applyProduct : null}
+                  />
+                ))}
+            </div>
+          )}
+
+          {tab === "fixtures" && (
+            <div className="store__fixtures">
+              <div className="store__fixtitle">집기 도구</div>
+              <div className="muted store__fixhint">
+                도구를 화면의 칸 위로 끌어다 놓거나, 칸을 고른 뒤 도구를 누르면 들어갑니다. 선반·행거는 화면에서 잡고 끌면 위아래로 움직입니다.
+              </div>
+              <div className="store__tools">
+                {PART_TYPES.map(([type, label]) => (
+                  <button
+                    key={type}
+                    type="button"
+                    draggable
+                    className="store__tool"
+                    title={baySel ? `${baySel}에 ${label} 넣기` : `화면의 칸 위로 끌어다 놓기`}
+                    onDragStart={(ev) => {
+                      ev.dataTransfer.setData(PART_MIME, type);
+                      ev.dataTransfer.effectAllowed = "copy";
+                    }}
+                    onClick={() => (baySel ? addPart(type, baySel) : setFixMsg("먼저 칸을 고르거나, 도구를 화면의 칸 위로 끌어다 놓으세요."))}
+                  >
+                    <PartIcon type={type} />
+                    <span>{label}</span>
+                    {baySel && <span className="store__toolleft">{partLeft(baySel, type)}</span>}
+                  </button>
+                ))}
+              </div>
+              {fixMsg && <div className="store__fixmsg">{fixMsg}</div>}
+
+              <div className="store__fixtitle">칸</div>
+              <div className="store__fixopts">
+                {shotBays.map((b) => (
+                  <button
+                    key={b.id}
+                    type="button"
+                    className={`store__fixopt${baySel === b.id ? " store__fixopt--on" : ""}`}
+                    onClick={() => pickBay(baySel === b.id ? null : b.id)}
+                  >
+                    {b.label}
+                  </button>
+                ))}
+              </div>
+
+              {baySel && (
+                <div className="store__fixcard">
+                  <div className="store__swaphead">
+                    <b>{baySel}</b>
+                    <span className="muted">들어 있는 집기 (위에서부터)</span>
+                    <button type="button" className="store__swapx" aria-label="선택 해제" onClick={() => pickBay(null)}>
+                      ×
+                    </button>
+                  </div>
+                  {bayRows(baySel).length === 0 && <div className="muted">비어 있어요. 위 도구를 넣어 보세요.</div>}
+                  {bayRows(baySel).map((r) => (
+                    <div key={r.key} className={`store__bayrow${r.on ? "" : " store__bayrow--off"}${fixSel === r.key ? " store__bayrow--on" : ""}`}>
+                      <button type="button" className="store__bayrowname" onClick={r.pick} disabled={!r.pick || !r.on}>
+                        {r.type ? <PartIcon type={r.type} /> : <span className="store__iconph" />}
+                        <span>{r.label}</span>
+                        {r.y !== null && <span className="muted">{(r.y / 10).toFixed(0)}cm</span>}
+                      </button>
+                      {r.flip && (
+                        <button
+                          type="button"
+                          className={`store__bayrowx${r.flipped ? " store__bayrowx--on" : ""}`}
+                          title="좌우 뒤집기 (정면걸이를 반대쪽으로)"
+                          onClick={r.flip}
+                        >
+                          ⇄
+                        </button>
+                      )}
+                      {r.lv && (
+                        <>
+                          <button type="button" className="store__bayrowx" title="올리기" onClick={() => r.lv && moveLevel(r.lv, levelDyOf(r.lv) + r.lv.step)}>
+                            ▲
+                          </button>
+                          <button type="button" className="store__bayrowx" title="내리기" onClick={() => r.lv && moveLevel(r.lv, levelDyOf(r.lv) - r.lv.step)}>
+                            ▼
+                          </button>
+                        </>
+                      )}
+                      <button type="button" className="store__bayrowx" title={r.on ? "빼기" : "다시 넣기"} onClick={r.act}>
+                        {r.on ? "✕" : "↺"}
+                      </button>
+                    </div>
+                  ))}
+                  {selFix?.part &&
+                    (() => {
+                      const lv = partLevel(selFix);
+                      return (
+                        <div className="store__fixmove">
+                          <b className="store__fixmovename">{selFix.label}</b>
+                          {lv && (
+                            <>
+                              <button type="button" onClick={() => moveLevel(lv, levelDyOf(lv) + lv.step)}>
+                                ▲ 위
+                              </button>
+                              <button type="button" onClick={() => moveLevel(lv, levelDyOf(lv) - lv.step)}>
+                                ▼ 아래
+                              </button>
+                            </>
+                          )}
+                          {lv && <span className="muted">{((lv.y + levelDyOf(lv)) / 10).toFixed(0)}cm</span>}
+                        </div>
+                      );
+                    })()}
+                  <div className="store__pickbtns">
+                    <button type="button" className="btn btn--sm" onClick={() => clearBay(baySel)}>
+                      칸 비우기
+                    </button>
+                    <button type="button" className="btn btn--sm" disabled={!bayFixtures(baySel).some(fixChanged)} onClick={() => resetBay(baySel)}>
+                      칸 원래대로
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {props.length > 0 && (
+                <>
+                  <div className="store__fixtitle">소도구</div>
+                  {props
+                    .filter((f) => {
+                      const st = fixStateOf(f.id);
+                      const its = f.options[0]?.itemIds ?? [];
+                      // a prop on a shelf / zone taken off is not there now
+                      return st.rm || !its.every((id) => fixOff.items.has(id));
+                    })
+                    .map((f) => {
+                      const st = fixStateOf(f.id);
+                      const on = fixSel === f.id;
+                      return (
+                        <div key={f.id} className={`store__bayrow${st.rm ? " store__bayrow--off" : ""}${on ? " store__bayrow--on" : ""}`}>
+                          <button type="button" className="store__bayrowname" disabled={st.rm} onClick={() => pickFixture(on ? null : f.id)}>
+                            <span className="store__iconph" />
+                            <span>{f.label}</span>
+                            <span className="muted">{f.group}{st.off.some(Boolean) ? ` · ${offText(st.off)}` : ""}</span>
+                          </button>
+                          <button type="button" className="store__bayrowx" title={st.rm ? "다시 놓기" : "빼기"} onClick={() => changeFixture(f.id, { rm: !st.rm })}>
+                            {st.rm ? "↺" : "✕"}
+                          </button>
+                        </div>
+                      );
+                    })}
+                  {selFix && !selFix.tier && !selFix.part && !fixStateOf(selFix.id).rm && (
+                    <div className="store__fixmove">
+                      <b className="store__fixmovename">{selFix.label}</b>
+                      <button type="button" onClick={() => nudgeFixture(selFix, -FIXTURE_STEP, 0, 0)}>
+                        ◀
+                      </button>
+                      <button type="button" onClick={() => nudgeFixture(selFix, FIXTURE_STEP, 0, 0)}>
+                        ▶
+                      </button>
+                      {selFix.move === "xy" && (
+                        <>
+                          <button type="button" onClick={() => nudgeFixture(selFix, 0, FIXTURE_STEP, 0)}>
+                            ▲
+                          </button>
+                          <button type="button" onClick={() => nudgeFixture(selFix, 0, -FIXTURE_STEP, 0)}>
+                            ▼
+                          </button>
+                        </>
+                      )}
+                      {selFix.move === "xz" && (
+                        <>
+                          <button type="button" onClick={() => nudgeFixture(selFix, 0, 0, FIXTURE_STEP)}>
+                            앞으로
+                          </button>
+                          <button type="button" onClick={() => nudgeFixture(selFix, 0, 0, -FIXTURE_STEP)}>
+                            뒤로
+                          </button>
+                        </>
+                      )}
+                      <button type="button" disabled={!fixStateOf(selFix.id).off.some(Boolean)} onClick={() => changeFixture(selFix.id, { off: [0, 0, 0] })}>
+                        제자리
+                      </button>
+                    </div>
+                  )}
+                </>
+              )}
+              <button type="button" className="btn btn--sm" disabled={!shotFixtures.some(fixChanged)} onClick={resetFixtures}>
+                집기 모두 원래대로
+              </button>
             </div>
           )}
 
@@ -2121,45 +3353,59 @@ export default function StoreViewer({
           )}
 
         </aside>
+        )}
       </div>
     </div>
   );
 }
 
+/** one category of the 상품 tab: every product under it as a 3-wide card grid; click = pick / unpick */
 function ProductFolder({
   node,
-  depth,
-  onAdd,
+  open,
+  current,
+  onPick,
 }: {
   node: ProductNode;
-  depth: number;
-  onAdd: (p: VmdProduct) => void;
+  open: boolean;
+  /** products now on the selected items: orange */
+  current: string[];
+  /** null: no item selected, the cards do nothing */
+  onPick: ((p: VmdProduct) => void) | null;
 }) {
+  const items = flatProducts(node);
+  const n = items.filter((p) => current.includes(p.id)).length;
   return (
-    <details className="store__folder" open style={{ marginLeft: depth ? 10 : 0 }}>
+    <details className="store__folder" open={open}>
       <summary>
-        <span aria-hidden>📁</span> {node.name} <span className="muted">({countProducts(node)})</span>
+        <span aria-hidden>📁</span> {node.name} <span className="muted">({items.length})</span>
+        {n > 0 && <span className="store__pickcount">{n}개 선택</span>}
       </summary>
-      {node.children.map((c) => (
-        <ProductFolder key={c.name} node={c} depth={depth + 1} onAdd={onAdd} />
-      ))}
-      {node.products.map((p) => (
-        <div key={p.id} className="store__product" style={{ marginLeft: 10 }}>
-          {p.thumb && (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img src={p.thumb} alt="" />
-          )}
-          <div>
-            <div className="store__pname">{p.color ?? p.name}</div>
-            <div className="muted" style={{ fontSize: 11 }}>
-              {p.id} · {p.mount === "hang" ? "행거에 걸기" : "바닥·선반에 놓기"}
-            </div>
-            <button type="button" className="btn btn--sm btn--accent" style={{ marginTop: 6 }} onClick={() => onAdd(p)}>
-              ＋ 매장에 추가
+      <div className="store__pgrid">
+        {items.map((p) => {
+          const on = current.includes(p.id);
+          return (
+            <button
+              key={p.id}
+              type="button"
+              className={`store__pcard${on ? " store__pcard--on" : ""}${onPick ? "" : " store__pcard--idle"}`}
+              aria-pressed={on}
+              title={`${p.path.slice(1).join(" / ")} · ${p.color ?? p.name} (${p.id})`}
+              onClick={() => onPick?.(p)}
+            >
+              {p.thumb ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img src={p.thumb} alt="" loading="lazy" />
+              ) : (
+                <span className="store__pcardph" />
+              )}
+              {on && <span className="store__pcheck" aria-hidden>✓</span>}
+              <b>{p.color ?? p.name}</b>
+              <span>{(p.path[1] ?? p.name).replace(/^\S+\s/, "")}</span>
             </button>
-          </div>
-        </div>
-      ))}
+          );
+        })}
+      </div>
     </details>
   );
 }

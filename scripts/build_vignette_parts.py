@@ -14,6 +14,7 @@ fixtures, so they are cut out of those fixtures (same meshes, materials and text
     wood post, laid flat and stretched into a shelf board in build_vignettes.py)
   - 포스터_글로시  the poster of photo 03
   - 옷걸이  the metal hanger of 옷걸이&맨투맨 (hook top at y 0): the viewer hangs VMD clothes without their own hook on it
+  - 바지걸이  the clip-bar pants hanger of 옷걸이 & 바지 (hook top at y 0): VMD 팬츠 / 스커트 hang on it
 
     python -X utf8 scripts/build_vignette_parts.py
 """
@@ -34,6 +35,7 @@ PEGBOARD = os.path.join(FF, "＊가구", "펜스_판넬", "[FITTING ROOM] 타공
 STAND_HANGER = os.path.join(FF, "국내-명동", "[디스커버리 명동]", "가구", "[DX명동]스탠드 행거__0ebf7bad.glb")
 PHOTO_CENTER = os.path.join(FF, "국내-명동", "[디스커버리 명동]", "매장연출", "03_중앙행거.png")
 SWEAT_ON_HANGER = os.path.join(FF, "＊소품", "의류&잡화", "의류", "옷걸이", "옷걸이&맨투맨__bcd34945.glb")
+PANTS_ON_HANGER = os.path.join(FF, "＊소품", "의류&잡화", "의류", "옷걸이", "옷걸이 & 바지__ZtJEzVE4.glb")
 PHOTO_SHOES = os.path.join(FF, "국내-명동", "[디스커버리 명동]", "매장연출", "02_신발월.png")
 
 
@@ -298,6 +300,9 @@ def main():
     # hanger: 430 wide, hook top 894 -> 0, shoulders ~120 below it
     subset(SWEAT_ON_HANGER, os.path.join(OUT, "옷걸이.glb"),
            lambda lo, hi, name: name.startswith("Aluminum_Anodized_DarkGray"), shift_mm=(0, -894, -20))
+    # pants hanger (clip bar): 320 wide, hook top 949 -> 0; the waist it grips starts 113 below the hook top
+    subset(PANTS_ON_HANGER, os.path.join(OUT, "바지걸이.glb"),
+           lambda lo, hi, name: lo[1] > 700, shift_mm=(2, -949, 7))
     photo = Image.open(PHOTO_CENTER)
     sx = photo.width / 475  # poster box in px of the 475 wide photo
     crop = photo.crop(tuple(round(v * sx) for v in (180, 36, 294, 114)))
