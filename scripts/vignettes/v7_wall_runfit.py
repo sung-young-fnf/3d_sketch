@@ -5,7 +5,7 @@
   bay 1 (wood):  shelf 1580 (RUN&FIT letters, framed poster P01, mountain sculpture), side-hung rail 1500 (8)
   bay 2 (white): poster P02 on the panel, shelf 1790 (2 shoes), shelf 1444 (3 caps H01-03), side-hung rail 1366 (10)
   bay 3 (wood):  shelf 1539 (2 torsos in T-shirts + D sculpture), rail 1460: 1 face-out + 5 side-hung
-  bay 4 (white): face-out bar 2450 (3 T-shirts), empty shelf 1413, side-hung rail 1350 (13)
+  bay 4 (white): round loop 2450 (3 face-out T-shirts), empty shelf 1413, side-hung rail 1350 (13)
   floor: two granite plinths with a pair of shoes each
 
 Scale: 3.14 mm per px of the 2000 px wide view (x1.2 for the 2400 px original), measured on the wall plane:
@@ -137,9 +137,14 @@ def build(V):
         # ---- bay 4: face-out T-shirts on a top bar, empty shelf, long side-hung rail
         x = bays[3]
         y = Y(555)
-        hung("b4-top", "4칸", "위 정면걸이", "D", 1, XF(1520), XF(1840), y, ["v7_티셔츠_토프", "v7_티셔츠_라임", "v7_티셔츠_화이트"],
-             3, 330, x, facing=0, z=[rail_z, rail_z + 30, rail_z - 30])
-        v.level("b4-top", "4칸", "위 봉", y, [bar("b4-topbar", x - 540, x + 540, y)], 1900, 2500, racks=["b4-top"])
+        # a round loop (photo px 1471-1762) out from the uprights to its front bar, T-shirts face-out along the front
+        V.LIB.setdefault("v4 고리", f"{D}/v4_고리.glb")
+        lx0, lx1 = XF(1471), XF(1762)
+        loop = v.put("v4 고리", "b4-loop", [lx0, y, 42], scale=((lx1 - lx0) / 484, 1, (rail_z - 42) / 233))
+        hung("b4-top", "4칸", "위 고리 정면걸이", "D", 1, XF(1525), XF(1790), y, ["v7_티셔츠_토프", "v7_티셔츠_라임", "v7_티셔츠_화이트"],
+             3, 400, x, facing=0, z=[rail_z, rail_z + 30, rail_z - 60])
+        v.racks[-1]["bounds"] = [-300, XF(1860) - XF(1525)]  # the white one hangs past the loop's end, at the niche corner
+        v.level("b4-top", "4칸", "위 고리", y, [loop], 1900, 2500, racks=["b4-top"])
         y = Y(885)
         v.level("b4-shelf", "4칸", "선반", y, [shelf("b4-shelf", x - 540, x + 600, y)], 1100, 1900)
         y = Y(905)

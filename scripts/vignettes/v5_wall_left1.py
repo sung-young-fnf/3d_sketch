@@ -4,7 +4,7 @@
   1 grey : shelf 1300 (2 AIRWELL posters) + bar: side-hung 3 + face-out 2 (shelf / bar run past the panel's left edge)
   2 wood : shelf 1200 with 2 torsos (M01 black hooded, M02 brown) + bar: side-hung 13
   3 grey : shelf 1330 (2 AIRWELL posters) + bar: side-hung 7 + face-out 1
-  4 wood : round loop 2200 with 2 face-outs + single arm with 1 face-out; shelf 1250 + bar: side-hung 10
+  4 wood : round loop 2200 with 2 side-hung + single arm with 1 face-out (옆걸이+정면걸이); shelf 1250 + bar: side-hung 10
            (pants, a vest and paddings; runs past the panel's right edge)
   floor  : a stone plinth in front of panel 3/4 with a pair of white sneakers
 Scale: the 4 panels (4 x 1007 mm) span 1710 px of the 2400 px photo -> 2.36 mm / px at the wall,
@@ -111,8 +111,9 @@ def build(V):
     with v.zone("b4-top", "4칸", "4칸 위", "위", dict(x=1510.5, w=980, z=60, y0=1950, y1=2450), "D"):
         loop = v.put("v5 고리", "b4-loop", [x, y, 0], scale=(-1, 1, 1))
         BAR_Z = 314  # the loop's front bar (hung() reads it)
-        racks = [hung("b4-loop", "4칸 위", "고리 정면걸이", "D", 1, x - 400, x - 50, y, ["패딩"] * 3, 2, 220,
-                      ["X26FDWDJ9M066_IVS", "X26FDWDJ80066_IVS"], facing=0, bounds=(-400, 700))]
+        # the loop carries its garments side-on (shoulder out), the arm right of it one face-out: 옆걸이+정면걸이
+        racks = [hung("b4-loop-side", "4칸 위", "고리 옆걸이", "D", 1, x - 420, x - 80, y, ["패딩"] * 4, 2, 170,
+                      ["X26FDWDJ9M066_IVS", "X26FDWDJ80066_IVS"], bounds=(-80, 400))]
         BAR_Z = 390
         v.rack("b4-arm", "4칸 위", "외팔 정면걸이", "패딩", "D", 4, [[x + 266, y - pad_h, 300 - 60 * k] for k in range(4)],
                1, "패딩", 0, gap=60, anchor="start", defaults=["X26FDWDJ9M066_GRL"])

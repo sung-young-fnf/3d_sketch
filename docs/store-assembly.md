@@ -202,3 +202,33 @@ python scripts/build_store_scene.py <projectId>
 - 이미지 슬롯: `Vignette.picture()` 로 놓은 포스터·화면은 slot `kind: "image"` (신발 월 P01 왼쪽 포스터, P02 TV, P03 오른쪽 포스터). 뷰어는 번호 → `이미지 파일 선택`, 또는 사진 파일을 그 판 위에 끌어다 놓으면 아이템 앞면(bbox 앞면 +2 mm)에 판 비율로 가운데를 채워(cover) 붙인다. 조명·톤매핑을 받지 않고(`MeshBasicMaterial`, `toneMapped: false`) 캔버스 색보정(CANVAS_GRADE)의 역을 미리 걸어 파일 색 그대로 보인다.
 - 화질: 렌더 시점(고정 시점)은 2배 슈퍼샘플(pixelRatio 2–3), 모델 텍스처는 최대 이방성 필터. `고화질 저장` = 지금 화면을 3840 px PNG 로(색보정 포함, 상품 번호·선택 박스 제외).
 - 착장 토르소 (패딩 월 M01): 맨 토르소 = 토르소 사진 5면(정·후·좌·우·위) → UniForge3D → `scripts/build_torso.py` → `부품/토르소.glb` (받침 원판 중심·바닥 = 원점, ×1.1). 착장 = ① GPT 이미지(god-tibo-imagen `--model gpt-6-astra`)에 토르소 사진 + 상품 공식 앞·뒤 사진(UniForge3D/painting/.../real_img)을 넣어 입힌 정면, 그 정면을 참고로 뒤·좌·우 → ② UniForge3D generate_3d (정·후 + 좌우 angle) → ③ **paint_texture (photo_hanger=False)** 로 입힌 앞·뒤를 4K 로 다시 칠함 — 걸이 상품과 같은 마무리(재질 거칠기 0.6, 금속 0)라 색·광택이 같아진다. UniForge3D 자체 텍스처(금속 1, webp)는 새까맣게 달라 보이니 쓰지 않는다 → ④ build_torso.py 로 받침 원판을 맞춰 `상품/착장/<스타일>/<스타일>_<컬러>.glb`. 슬롯은 `fit: "model"` + `clip: [선반, 3000]`. 같은 파일 이름이 패딩·착장 두 카테고리에 있으면 상품 id 는 `카테고리/스타일_컬러` (web/src/lib/scenes.ts). 대안: `scripts/blender_dress_torso.py` 는 걸이 상품 glb 를 그대로 토르소에 입힌다(소매 직선 + 손, 또는 bent) — 상품 메쉬는 소매·몸통이 붙어 있어 굽히면 옆구리가 일그러진다.
+
+## 11. 연출표 불러오기 (벽장별 연출상품 HTML → 매장연출 한 번에)
+
+매장연출 탭 오른쪽 위 **연출표 불러오기 (AI)**. 코드: `web/src/lib/vmd-plan.ts`(분석·적용, 순수 함수),
+`web/src/components/VmdPlanImport.tsx`(창), `web/src/app/api/vmd-plan/route.ts`(AI).
+
+1. **HTML 읽기 (브라우저, 규칙)** — 연출표 HTML 은 데이터를 JSON 스크립트로 들고 있다: `#state`(벽장 W1.. → 블록
+   fo / acc / muf / h1~h4 / shoe → 품번-컬러 순서), `#wmeta`(위치·컨셉), `#cat`(상품 정보). 사진(base64)은 쓰지 않는다.
+   `wmeta.sec` 에 "1층" 이 없는 벽장(2층)은 뺀다.
+2. **품번 → 3D 상품** — 라이브러리 파일명은 시즌 접두 4자리가 붙는다: `DWDJ9R066-IVS` = `X26FDWDJ9R066_IVS`.
+3. **AI (서버, `claude -p`)** — 브라우저가 요약(벽장·블록 수, 각 연출의 보이는 rack / 용품·신발 자리 수, 3D 없는 품번과
+   후보 30개)만 보내면 서버가 **이 PC 에 로그인된 Claude Code CLI** 를 도구 없이(`--tools ""`) 실행해 JSON 스키마로 받는다:
+   벽장 → 연출, 블록 → rack id 들 / `pool:<카테고리>`, 대체 상품, 집기 제안. 앱은 키를 갖지 않는다(각자 구독).
+   localhost 요청만 받는다. 같은 요약은 `data/vmd-plans/<hash>.json` 캐시. CLI 위치는 PATH → `~/.local/bin/claude(.exe)` → `CLAUDE_BIN`.
+   **다른 PC 에서 접속(http://<서버 IP>:3939)** 하면 서버의 Claude 를 쓰지 않는다: 그 사람이 PowerShell 에
+   `irm "http://<서버>/api/vmd-plan/helper?t=<토큰>" | iex` (창에 표시, 복사 버튼) 을 실행해 두면, 그 PC 의 도우미가
+   `/api/vmd-plan/relay` 에서 작업을 받아 **자기 PC 의 claude -p** 로 분석해 돌려준다(브라우저 → localhost 접근 없음).
+   토큰은 브라우저마다 무작위(`fnf3d:vmd-ai-token`), 도우미 창을 닫으면 끝.
+4. **미리보기에서 고치기** — 벽장별 연출 선택, 블록별 자리 칩 추가/빼기, 대체 상품 선택. 블록 옆 `놓은/전체` 와 부족 사유.
+5. **적용** — 블록 상품을 rack 순서대로 채우고(rack 개수 = 건 수) pool 은 상품 카테고리 자리를 왼쪽부터 채워
+   `vmd-swaps:<pid>` 와 `vmd-racks:<pid>` 를 연출마다 덮어쓴다(이전 값은 `vmd-plan:backup` → **적용 전으로 되돌리기**).
+
+상태 저장: StoreViewer 의 `pageMemory` 는 이 브라우저 localStorage(`fnf3d:` 키)라 새로고침해도 남는다(붙인 사진 파일은 페이지 동안만).
+매장연출 탭은 최근 8개(명동 전부)를 불러 둔 채 숨겨 두고(다시 눌러도 다시 불러오지 않음, 숨은 동안 렌더 쉼),
+속도: 파싱한 모델은 페이지 전체가 공유(`sharedModels`, 탭마다 다시 파싱하지 않음), 첫 탭이 다 뜨면 나머지 탭을 하나씩
+뒤에서 미리 불러온다(`onReady`). 연출표 적용은 다시 마운트하지 않고 `reloadPlan()` 으로 상품·걸이 수만 바꾸며, 보고 있는 탭이 먼저,
+숨은 탭은 한 개씩 차례로(`planQueue`). 상품 목록 썸네일은 `/api/assets/...png?w=120` (sharp WebP). 상품 원본 glb(~50 MB)는 무거우니
+새 상품을 넣으면 `build_product_lite.py` 로 `상품_웹` 사본을 꼭 만든다(없으면 원본을 그대로 받아 탭이 느려진다).
+**전체 보기** 는 연출마다 마지막 그림(불러온 뒤 / 상품이 바뀐 뒤 3초) 격자, **모두 둘러보기** 는 01~08 을 차례로 열어 그림을 새로 만든다.
+

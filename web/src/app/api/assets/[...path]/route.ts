@@ -3,6 +3,23 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import { ASSETS_DIR } from "@/lib/paths";
 
+/** ?w=<px> on a png / jpg / webp: a small WebP (product thumbnails in lists are 600x800 PNGs of ~450 KB) */
+const SMALL = new Map<string, { at: number; buf: Buffer }>();
+async function smallImage(file: string, mtime: number, w: number): Promise<Buffer | null> {
+  const key = `${file}|${w}`;
+  const hit = SMALL.get(key);
+  if (hit && hit.at === mtime) return hit.buf;
+  try {
+    const sharp = (await import("sharp")).default;
+    const buf = await sharp(file).resize({ width: w, withoutEnlargement: true }).webp({ quality: 80 }).toBuffer();
+    if (SMALL.size > 4000) SMALL.clear();
+    SMALL.set(key, { at: mtime, buf });
+    return buf;
+  } catch {
+    return null; // no sharp: the full file
+  }
+}
+
 export const dynamic = "force-dynamic";
 
 const CONTENT_TYPES: Record<string, string> = {
@@ -97,6 +114,18 @@ export async function GET(request: Request, context: { params: Promise<{ path: s
   const ext = path.extname(target).toLowerCase();
   const contentType = CONTENT_TYPES[ext] ?? "application/octet-stream";
   const url = new URL(request.url);
+  const w = Number(url.searchParams.get("w"));
+  if (w >= 16 && w <= 1024 && [".png", ".jpg", ".jpeg", ".webp"].includes(ext)) {
+    const buf = await smallImage(target, stat.mtimeMs, Math.round(w));
+    if (buf)
+      return new Response(new Uint8Array(buf), {
+        headers: {
+          "Content-Type": "image/webp",
+          "Cache-Control": "public, max-age=3600",
+          "Last-Modified": stat.mtime.toUTCString(),
+        },
+      });
+  }
   const asDownload = url.searchParams.get("download") === "1";
 
   const headers = new Headers({

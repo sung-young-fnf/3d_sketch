@@ -113,8 +113,13 @@ type Engine = {
   snapshot: (width: number) => string;
   /** show n garments on a rack (re-spaced); garments past n lose their swap */
   setRackCount: (rackId: string, n: number) => void;
+  /** 연출표 적용: take the saved swaps / rack counts again (written by VmdPlanImport) without reloading the store */
+  reloadPlan: () => Promise<void>;
   /** hang a rack's garments side-on (true) or face-out; they are spread evenly again */
   setRackSide: (rackId: string, side: boolean) => void;
+  /** 상품 표시: turn a cap / glove / shoe ... (not a rack garment) to `deg` about its upright axis from how it was built */
+  turnItem: (itemId: string, deg: number) => void;
+  turnOf: (itemId: string) => number;
   /** take this rack garment out: the ones after it move up one place, keeping their products */
   removeFromRack: (itemId: string) => void;
   /** box the garments of this rack (null clears) */
@@ -254,9 +259,37 @@ function PartIcon({ type }: { type: string }) {
   }
 }
 
-/** added products / swaps live for the page: they carry across tabs (전체 렌더링 shows
- *  what 3D 매장 보기 added) but a reload starts the store fresh */
-const pageMemory = new Map<string, string>();
+/** added products / swaps / 집기 per store: they carry across tabs and survive a reload (this browser's
+ *  localStorage, "fnf3d:" keys); 연출표 불러오기 writes the same keys for every 매장연출 at once */
+export const STORE_PREFIX = "fnf3d:";
+export const pageMemory = {
+  get(key: string): string | undefined {
+    try {
+      return localStorage.getItem(STORE_PREFIX + key) ?? undefined;
+    } catch {
+      return undefined;
+    }
+  },
+  set(key: string, value: string) {
+    try {
+      localStorage.setItem(STORE_PREFIX + key, value);
+    } catch {
+      /* full / blocked: this page only */
+    }
+  },
+  delete(key: string) {
+    try {
+      localStorage.removeItem(STORE_PREFIX + key);
+    } catch {
+      /* blocked */
+    }
+  },
+};
+/** parsed models shared by every viewer of the page (매장연출 tabs use the same hangers, rails and products):
+ *  a tab opened after another parses only what is new. Viewers clone them and never dispose the shared geometry. */
+const sharedModels = new Map<string, THREE.Object3D>();
+/** 연출표 적용 to tabs not on screen: one after another, so the tab being looked at loads its products first */
+let planQueue: Promise<void> = Promise.resolve();
 /** placed images per scene: item id -> file (same page lifetime as pageMemory) */
 const pagePictures = new Map<string, Map<string, { file: Blob; name: string }>>();
 
@@ -457,10 +490,25 @@ export default function StoreViewer({
   scene,
   products,
   mode = "shots",
+  onSnapshot,
+  snapTick = 0,
+  planTick = 0,
+  onReady,
+  active = true,
 }: {
   scene: StoreScene;
   products: VmdProduct[];
   mode?: "shots" | "orbit";
+  /** 매장연출 전체 보기: a small picture of the view once it has loaded / after products change */
+  onSnapshot?: (url: string) => void;
+  /** a new value asks for a new picture (모두 둘러보기 visiting a tab that is already loaded) */
+  snapTick?: number;
+  /** a new value: the saved 연출표 changed - follow it in place (no reload) */
+  planTick?: number;
+  /** the store's furniture finished loading (매장연출 loads the next tab in the background then) */
+  onReady?: () => void;
+  /** shown now (매장연출 keeps hidden tabs loaded): a new 연출표 goes here first, hidden tabs take it in turn */
+  active?: boolean;
 }) {
   const orbit = mode === "orbit";
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -606,14 +654,21 @@ export default function StoreViewer({
         })
         .then((buf) => loader.parseAsync(buf, url.slice(0, url.lastIndexOf("/") + 1)))
         .catch((err: unknown) => (downloads.signal.aborted ? new Promise<GLTF>(() => {}) : Promise.reject(err)));
+    /** a model parsed once per page (sharedModels), prepared by `prep` the first time */
+    const fetchShared = (key: string, url: string, prep: (m: THREE.Object3D) => void) => {
+      const hit = sharedModels.get(key);
+      if (hit) return Promise.resolve(hit);
+      return fetchGltf(url).then((gltf: GLTF) => {
+        prep(gltf.scene);
+        sharedModels.set(key, gltf.scene);
+        return gltf.scene;
+      });
+    };
     const modelCache = new Map<string, Promise<THREE.Object3D>>();
     const loadModel = (url: string) => {
       let p = modelCache.get(url);
       if (!p) {
-        p = fetchGltf(url).then((gltf: GLTF) => {
-          sharpen(gltf.scene, anisotropy);
-          return gltf.scene;
-        });
+        p = fetchShared(`m:${url}`, url, (m) => sharpen(m, anisotropy));
         modelCache.set(url, p);
       }
       return p;
@@ -920,10 +975,9 @@ export default function StoreViewer({
     const loadProduct = (product: VmdProduct) => {
       let p = productModel.get(product.id);
       if (!p) {
-        p = fetchGltf(product.url).then((gltf: GLTF) => {
-          sharpen(gltf.scene, anisotropy);
-          photoLook(gltf.scene);
-          return gltf.scene;
+        p = fetchShared(`p:${product.url}`, product.url, (m) => {
+          sharpen(m, anisotropy);
+          photoLook(m);
         });
         productModel.set(product.id, p);
       }
@@ -1064,6 +1118,9 @@ export default function StoreViewer({
       }
     };
     const swapping = new Map<string, object>(); // item id -> latest setSwap call: an older one that resolves late drops out
+    /** 상품 표시 방향: item id -> degrees turned about its upright axis (caps, gloves, shoes ... not rack garments) */
+    const turned = new Map<string, number>();
+    const yaw = (deg: number) => new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), (deg * Math.PI) / 180);
     const setSwap = async (itemId: string, product: VmdProduct | null) => {
       const original = itemById.get(itemId);
       if (!original) return;
@@ -1139,6 +1196,8 @@ export default function StoreViewer({
         if (pose.facing !== undefined) q.setFromAxisAngle(new THREE.Vector3(0, 1, 0), (pose.facing * Math.PI) / 180);
         else original.getWorldQuaternion(q);
         if (slotItem.tilt) q.multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), (slotItem.tilt * Math.PI) / 180));
+        const turn = turned.get(itemId);
+        if (turn) q.premultiply(yaw(turn));
         h.quaternion.copy(q);
         h.scale.set(1, 1, pose.depth);
         h.position.copy(slotPoint(original, mount === "hang" ? 1 : -1));
@@ -1657,6 +1716,34 @@ export default function StoreViewer({
     } catch {
       /* nothing saved */
     }
+    const turnKey = `vmd-turn:${scene.projectId}`;
+    const turnItem = (itemId: string, deg: number) => {
+      const holder = itemById.get(itemId);
+      if (!holder || rackOf.has(itemId)) return;
+      deg = ((Math.round(deg) % 360) + 360) % 360;
+      const d = deg - (turned.get(itemId) ?? 0);
+      if (!d) return;
+      // about the item's own centre (the holder sits at its bbox centre), the swapped product about its base / hook
+      const p = new THREE.Vector3().setFromMatrixPosition(holder.matrix);
+      holder.matrix
+        .premultiply(new THREE.Matrix4().makeTranslation(-p.x, -p.y, -p.z))
+        .premultiply(new THREE.Matrix4().makeRotationY((d * Math.PI) / 180))
+        .premultiply(new THREE.Matrix4().makeTranslation(p.x, p.y, p.z));
+      holder.matrixWorldNeedsUpdate = true;
+      holder.updateWorldMatrix(true, true);
+      if (itemBoxes.has(holder)) itemBoxes.set(holder, new THREE.Box3().setFromObject(holder));
+      swapped.get(itemId)?.quaternion.premultiply(yaw(d));
+      if (deg) turned.set(itemId, deg);
+      else turned.delete(itemId);
+      pageMemory.set(turnKey, JSON.stringify(Object.fromEntries(turned)));
+      fitMarks();
+    };
+    try {
+      const saved = JSON.parse(pageMemory.get(turnKey) ?? "{}") as Record<string, number>;
+      for (const [id, deg] of Object.entries(saved)) turnItem(id, deg);
+    } catch {
+      /* nothing saved */
+    }
     let slide: { id: string; slot: string; plane: THREE.Plane; p0: THREE.Vector3; dx0: number; x: number; y: number; moved: boolean } | null =
       null;
     const draggable = (slotId: string | null) => {
@@ -1967,7 +2054,7 @@ export default function StoreViewer({
 
     const onKeyDown = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement | null;
-      if (orbit || (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA"))) return;
+      if (!host.clientWidth || orbit || (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA"))) return;
       const k = e.key.toLowerCase();
       const sel = selectedUid ? placedMap.get(selectedUid) : null;
       if (sel && (k === "q" || k === "e")) {
@@ -1994,7 +2081,7 @@ export default function StoreViewer({
     const held = new Set<string>();
     const onMoveKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement | null;
-      if (!orbit || (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA"))) return;
+      if (!host.clientWidth || !orbit || (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA"))) return;
       const k = e.key.toLowerCase();
       if (!MOVE_KEYS[k]) return;
       e.preventDefault(); // arrows would scroll the page
@@ -2076,6 +2163,7 @@ export default function StoreViewer({
     let last = performance.now();
     const tick = () => {
       raf = requestAnimationFrame(tick);
+      if (!host.clientWidth) return; // a 매장연출 tab kept in the background
       const now = performance.now();
       moveBy(Math.min((now - last) / 1000, 0.1));
       last = now;
@@ -2090,6 +2178,7 @@ export default function StoreViewer({
     const onResize = () => {
       const w = host.clientWidth;
       const h = host.clientHeight;
+      if (!w || !h) return;
       renderer.setSize(w, h, false);
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
@@ -2158,6 +2247,41 @@ export default function StoreViewer({
       setRackCount(rackId, n) {
         const r = racks.find((x) => x.id === rackId);
         if (r) layoutRack(r, n);
+      },
+      reloadPlan() {
+        let savedRacks: Record<string, number | { n: number; t?: number[] }> = {};
+        let savedSwaps: Swaps = {};
+        try {
+          savedRacks = JSON.parse(pageMemory.get(rackKey) ?? "{}");
+          savedSwaps = JSON.parse(pageMemory.get(swapKey) ?? "{}");
+        } catch {
+          /* keep what is shown */
+        }
+        for (const r of racks) {
+          const v = savedRacks[r.id];
+          const n = typeof v === "number" ? v : (v?.n ?? r.count);
+          if (n === (counts.get(r.id) ?? r.count) && !(typeof v === "object" && v.t)) continue;
+          spots.delete(r.id); // spread evenly, as a fresh load would
+          layoutRack(r, n, typeof v === "object" ? v.t : undefined);
+        }
+        const allSlots = scene.shots.flatMap((x) => x.slots ?? []);
+        const now = new Map([...swapped].map(([id, h]) => [id, h.userData.productId as string]));
+        const jobs: Promise<void>[] = [];
+        for (const id of new Set([...now.keys(), ...Object.keys(savedSwaps)])) {
+          const want = savedSwaps[id];
+          if (now.get(id) === want) continue;
+          const cat = allSlots.find((x) => x.itemId === id)?.category;
+          const product = want ? (productById.get(want) ?? productById.get(`${cat}/${want}`) ?? null) : null;
+          jobs.push(setSwap(id, product).catch(() => {}));
+        }
+        saveRacks();
+        return Promise.all(jobs).then(() => {});
+      },
+      turnItem(itemId, deg) {
+        turnItem(itemId, deg);
+      },
+      turnOf(itemId: string) {
+        return turned.get(itemId) ?? 0;
       },
       setRackSide(rackId, side) {
         const r = racks.find((x) => x.id === rackId);
@@ -2296,7 +2420,10 @@ export default function StoreViewer({
     if (!orbit && first) goShot(first);
     if (!orbit) setAnchors(engineRef.current.slotAnchors());
     // handle for headless checks (scripts / devtools): projection, placement and 준공도면 tests
-    (window as unknown as { __store?: unknown }).__store = {
+    // debug handles: the last viewer opened, and every viewer by project id (매장연출 tabs load in the background)
+    const dbg = window as unknown as { __store?: unknown; __stores?: Record<string, unknown> };
+    dbg.__stores ??= {};
+    dbg.__stores[scene.projectId] = dbg.__store = {
       THREE,
       camera,
       world,
@@ -2336,6 +2463,36 @@ export default function StoreViewer({
   // ---------------------------------------------------------------- UI
   const e = () => engineRef.current;
   const loading = progress.total > 0 && progress.done < progress.total;
+  const readyRef = useRef(onReady);
+  readyRef.current = onReady;
+  useEffect(() => {
+    if (!loading && progress.total > 0) readyRef.current?.();
+  }, [loading, progress.total]);
+  const planDone = useRef(0);
+  useEffect(() => {
+    if (!planTick || planDone.current === planTick) return;
+    const run = () => {
+      if (planDone.current === planTick) return Promise.resolve();
+      planDone.current = planTick;
+      const job = engineRef.current?.reloadPlan() ?? Promise.resolve();
+      // a tab closed mid-way never settles its downloads: the queue does not wait for it forever
+      return Promise.race([job, new Promise<void>((r) => window.setTimeout(r, 60_000))]);
+    };
+    if (active) void run();
+    else planQueue = planQueue.then(run, run); // one hidden tab at a time, after the one on screen
+  }, [planTick, active]);
+  // 매장연출 전체 보기: a picture once loaded and again after products / 집기 change (models load in after a swap)
+  const snapRef = useRef(onSnapshot);
+  snapRef.current = onSnapshot;
+  useEffect(() => {
+    if (!snapRef.current || loading || progress.total === 0) return;
+    const t = window.setTimeout(() => {
+      if (!hostRef.current?.clientWidth) return;
+      const url = engineRef.current?.snapshot(640);
+      if (url) snapRef.current?.(url);
+    }, 3000);
+    return () => window.clearTimeout(t);
+  }, [loading, progress.total, swaps, rackCounts, fixState, levelDys, shot, snapTick]);
   const missing = scene.floors.reduce((n, f) => n + f.missing.reduce((m, x) => m + x.count, 0), 0);
   const floorLabel = (s: SceneShot) =>
     `${scene.floors.find((f) => f.id === s.floorId)?.title.replace("Floor ", "") ?? "?"}F`;
@@ -2406,6 +2563,11 @@ export default function StoreViewer({
   const selSlots = sel.map(slotOf).filter((x): x is NonNullable<typeof x> => !!x);
   const selCats = [...new Set(selSlots.map((x) => x.category).filter((x): x is string => !!x))];
   const selRackItems = selSlots.filter((x) => (shot?.racks ?? []).some((r) => r.slotIds.includes(x.id)));
+  // caps, gloves, shoes ... (not rack garments, not pictures) turn on the spot: by 45° steps, or to front / side
+  const selPlaced = selSlots.filter((x) => x.kind !== "image" && !selRackItems.includes(x));
+  const turnSel = (step: number | null, to?: number) => {
+    for (const x of selPlaced) e()?.turnItem(x.itemId, step === null ? (to ?? 0) : (e()?.turnOf(x.itemId) ?? 0) + step);
+  };
   const applyProduct = (p: VmdProduct | null) => {
     for (const x of selSlots) e()?.setSwap(x.itemId, p);
   };
@@ -3095,6 +3257,23 @@ export default function StoreViewer({
                           >
                             옷 빼기 {selRackItems.length}
                           </button>
+                        )}
+                        {selPlaced.length > 0 && (
+                          <span className="store__turn" title="모자·장갑·신발 등 방향 (행거 옷은 행거 옆걸이/정면걸이로)">
+                            방향
+                            <button type="button" className="btn btn--sm" title="왼쪽으로 45°" onClick={() => turnSel(-45)}>
+                              ↺
+                            </button>
+                            <button type="button" className="btn btn--sm" onClick={() => turnSel(null, 0)}>
+                              정면
+                            </button>
+                            <button type="button" className="btn btn--sm" onClick={() => turnSel(null, 90)}>
+                              옆면
+                            </button>
+                            <button type="button" className="btn btn--sm" title="오른쪽으로 45°" onClick={() => turnSel(45)}>
+                              ↻
+                            </button>
+                          </span>
                         )}
                         <button type="button" className="btn btn--sm" onClick={() => selectSlots(productBadgeIds)}>
                           모두 선택

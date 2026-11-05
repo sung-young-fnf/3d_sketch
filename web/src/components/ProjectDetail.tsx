@@ -1,10 +1,11 @@
 "use client";
 
 import Link from "next/link";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import FloorPlan from "@/components/FloorPlan";
 import StoreViewer from "@/components/StoreViewer";
 import Thumb from "@/components/Thumb";
+import VmdPlanImport from "@/components/VmdPlanImport";
 import type { Floor } from "@/lib/floorplan";
 import type { Counts, ProjectUser, RenderPanel, RenderTag } from "@/lib/projects";
 import type { DrawingPage, StoreScene, VmdProduct } from "@/lib/scene-types";
@@ -201,26 +202,151 @@ function FloorPlans({ floors, localProductIds }: { floors: Floor[]; localProduct
 }
 
 /** 준공도면 pages (data/drawings/<id>.json) - one large page at a time */
-/** 매장연출: one display wall per reference photo, same 상품 표시 / 상품 변경 as 3D 매장 보기 */
+/** 매장연출 tabs kept loaded at once (hidden ones do not render); 명동 has 8, all stay */
+const KEEP_ALIVE = 8;
+const OVERVIEW = "__all";
+
+/** 매장연출: one display wall per reference photo, same 상품 표시 / 상품 변경 as 3D 매장 보기.
+ *  Tabs opened stay loaded (no reload on the way back); 전체 보기 shows every wall's latest picture;
+ *  연출표 불러오기 dresses them all from a 벽장별 연출상품 HTML. */
 function Vignettes({ scenes, products }: { scenes: StoreScene[]; products: VmdProduct[] }) {
-  const [active, setActive] = useState(scenes[0]?.projectId);
-  const scene = scenes.find((s) => s.projectId === active) ?? scenes[0];
-  if (!scene) return null;
+  const [active, setActive] = useState<string>(scenes[0]?.projectId ?? OVERVIEW);
+  const [alive, setAlive] = useState<string[]>(scenes[0] ? [scenes[0].projectId] : []);
+  const [planTick, setPlanTick] = useState<Record<string, number>>({});
+  const [shots, setShots] = useState<Record<string, string>>({});
+  const [importing, setImporting] = useState(false);
+  const [tour, setTour] = useState<string[] | null>(null); // 모두 둘러보기: vignettes still to visit
+  const [applied, setApplied] = useState<string | null>(null);
+
+  const open = (pid: string) => {
+    setActive(pid);
+    if (pid === OVERVIEW) return;
+    setAlive((a) => [pid, ...a.filter((x) => x !== pid)].slice(0, KEEP_ALIVE));
+  };
+  const tourRef = useRef<string[] | null>(null);
+  const onShot = (pid: string) => (url: string) => {
+    setShots((m) => ({ ...m, [pid]: url }));
+    // 모두 둘러보기: next one as soon as this one is pictured
+    const t = tourRef.current;
+    if (!t || t[0] !== pid) return;
+    const rest = t.slice(1);
+    tourRef.current = rest.length ? rest : null;
+    setTour(tourRef.current);
+    if (rest.length) open(rest[0]);
+    else setActive(OVERVIEW);
+  };
+  const startTour = () => {
+    const order = scenes.map((s) => s.projectId);
+    tourRef.current = order;
+    setTour(order);
+    open(order[0]);
+  };
+  // tabs load one after another in the background, so a click later shows a store already there
+  const onReady = (pid: string) => () => {
+    setAlive((a) => {
+      if (!a.includes(pid)) return a;
+      const next = scenes.find((s) => !a.includes(s.projectId));
+      return next && a.length < KEEP_ALIVE ? [...a, next.projectId] : a;
+    });
+  };
+  const onApplied = (pids: string[]) => {
+    setImporting(false);
+    // loaded tabs follow the new swaps / rack counts in place (no reload); the others read them when they load
+    setPlanTick((v) => ({ ...v, ...Object.fromEntries(pids.map((p) => [p, (v[p] ?? 0) + 1])) }));
+    setShots((m) => Object.fromEntries(Object.entries(m).filter(([k]) => !pids.includes(k))));
+    setApplied(
+      `${pids.length}개 매장연출에 적용했습니다. 지금 보는 탭부터 상품을 바꾸고, 나머지 탭은 차례로 바꿉니다. 전체 그림은 「전체 보기 → 모두 둘러보기」.`,
+    );
+  };
+
+  if (!scenes.length) return null;
   return (
     <div>
       <div className="subtabs">
+        <button
+          type="button"
+          className={`subtab${active === OVERVIEW ? " subtab--on" : ""}`}
+          onClick={() => open(OVERVIEW)}
+        >
+          전체 보기
+        </button>
         {scenes.map((s) => (
           <button
             key={s.projectId}
             type="button"
-            className={`subtab${s.projectId === scene.projectId ? " subtab--on" : ""}`}
-            onClick={() => setActive(s.projectId)}
+            className={`subtab${s.projectId === active ? " subtab--on" : ""}`}
+            onClick={() => open(s.projectId)}
           >
             {s.name}
           </button>
         ))}
+        <button type="button" className="btn btn--sm btn--accent" style={{ marginLeft: "auto" }} onClick={() => setImporting(true)}>
+          연출표 불러오기 (AI)
+        </button>
       </div>
-      <StoreViewer key={scene.projectId} scene={scene} products={products} />
+      {applied && active !== OVERVIEW && (
+        <div className="vplan__tour">
+          <span className="vplan__ok">{applied}</span>
+          <button type="button" className="btn btn--sm" onClick={() => setApplied(null)}>
+            닫기
+          </button>
+        </div>
+      )}
+      {tour && (
+        <div className="vplan__tour">
+          모두 둘러보는 중… {scenes.length - tour.length + 1}/{scenes.length}{" "}
+          <button type="button" className="btn btn--sm" onClick={() => ((tourRef.current = null), setTour(null), open(OVERVIEW))}>
+            멈추기
+          </button>
+        </div>
+      )}
+      {active === OVERVIEW && (
+        <div>
+          <div className="vplan__ovhead">
+            {applied && <span className="vplan__ok">{applied}</span>}
+            <button type="button" className="btn btn--sm" style={{ marginLeft: "auto" }} onClick={startTour} disabled={!!tour}>
+              모두 둘러보기 (그림 새로 만들기)
+            </button>
+          </div>
+          <div className="vplan__grid">
+            {scenes.map((s) => {
+              const url = shots[s.projectId] ?? s.shots[0]?.thumb ?? null;
+              return (
+                <button key={s.projectId} type="button" className="vplan__card" onClick={() => open(s.projectId)}>
+                  {url ? (
+                    /* eslint-disable-next-line @next/next/no-img-element */
+                    <img src={url} alt={s.name} />
+                  ) : (
+                    <span className="vplan__ph">아직 그림 없음</span>
+                  )}
+                  <span className="vplan__cap">
+                    {s.name}
+                    {!shots[s.projectId] && <i className="muted"> · 원본 렌더</i>}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+      {scenes
+        .filter((s) => alive.includes(s.projectId))
+        .map((s) => (
+          <div key={s.projectId} style={{ display: s.projectId === active ? undefined : "none" }}>
+            <StoreViewer
+              scene={s}
+              products={products}
+              onSnapshot={onShot(s.projectId)}
+              snapTick={tour?.[0] === s.projectId ? tour.length : 0}
+              planTick={planTick[s.projectId] ?? 0}
+              onReady={onReady(s.projectId)}
+              active={s.projectId === active}
+            />
+          </div>
+        ))}
+      {importing && (
+        <VmdPlanImport scenes={scenes} products={products} onClose={() => setImporting(false)} onApplied={onApplied} />
+      )}
     </div>
   );
 }
