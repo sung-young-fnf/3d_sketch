@@ -1,0 +1,21 @@
+# 3D assets, site photos and archisketch data stay local (sizes over GitHub limits; data is internal)
+/assets/
+/data/
+/tools/
+/blender/
+
+# secrets
+.env
+.env.*
+
+# web build
+web/node_modules/
+web/.next/
+web/tsconfig.tsbuildinfo
+web/next-env.d.ts
+
+# python / misc
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
